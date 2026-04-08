@@ -166,6 +166,7 @@ from parlant.core.nlp.generation import (
 from parlant.core.nlp.tokenization import EstimatingTokenizer
 from parlant.core.persistence.common import ObjectId
 from parlant.core.persistence.document_database import DocumentDatabase, identity_loader_for
+from parlant.core.persistence.vector_database import VectorDatabase
 from parlant.core.relationships import (
     RelationshipKind,
     RelationshipDocumentStore,
@@ -259,11 +260,14 @@ from parlant.core.engines.alpha.perceived_performance_policy import (
 )
 from parlant.core.engines.alpha.planners import (
     BasicPlanner,
-    NullPlan,
-    NullPlanner,
     Plan,
     Planner,
+    NullPlanner,
     PlannerProvider,
+)
+from parlant.core.engines.alpha.planning.basic_planner import (
+    MultiStepPlanner,
+    MultiStepPlanSchema,
 )
 from parlant.bin.server import PARLANT_HOME_DIR, start_parlant, StartupParameters
 from parlant.core.services.tools.plugins import PluginServer, ToolEntry, tool
@@ -941,15 +945,6 @@ class Relationship:
 
 
 @dataclass(frozen=True)
-class ToolCall:
-    """Represents a tool call by the agent."""
-
-    tool_id: ToolId
-    arguments: Mapping[str, JSONSerializable]
-    result: ToolResult
-
-
-@dataclass(frozen=True)
 class GuidelineMatch:
     """Result of a custom guideline matcher."""
 
@@ -976,33 +971,6 @@ class GuidelineMatchingContext:
     customer: Customer
     variables: Mapping[Variable, JSONSerializable]
     staged_events: Sequence[EmittedEvent]
-
-    @property
-    def staged_tool_calls(self) -> Sequence[ToolCall]:
-        """Returns the staged events that are tool calls."""
-        core_tool_calls = chain.from_iterable(
-            [
-                cast(ToolEventData, e.data)["tool_calls"]
-                for e in self.staged_events
-                if e.kind == EventKind.TOOL
-            ]
-        )
-
-        return [
-            ToolCall(
-                tool_id=ToolId.from_string(call["tool_id"]),
-                arguments=call["arguments"],
-                result=ToolResult(
-                    data=call["result"].get("data"),
-                    metadata=call["result"].get("metadata"),
-                    control=call["result"].get("control"),
-                    canned_responses=call["result"].get("canned_responses"),
-                    canned_response_fields=call["result"].get("canned_response_fields"),
-                    guidelines=call["result"].get("guidelines"),
-                ),
-            )
-            for call in core_tool_calls
-        ]
 
     @classmethod
     async def _from_core(
@@ -5224,6 +5192,50 @@ class Server:
 
                 return db
 
+            _shared_pg_pools: dict[str, Any] = {}
+
+            async def _get_shared_pg_pool(dsn: str) -> Any:
+                nonlocal _shared_pg_pools
+
+                if dsn in _shared_pg_pools:
+                    return _shared_pg_pools[dsn]
+
+                if importlib.util.find_spec("asyncpg") is None:
+                    raise SDKError(
+                        "PostgreSQL requires additional packages to be installed. "
+                        "Please install parlant[postgres] to use PostgreSQL."
+                    )
+
+                import asyncpg  # type: ignore[import-untyped]
+
+                from parlant.adapters.db.postgres_db import PostgresDocumentDatabase
+
+                pool = await asyncpg.create_pool(
+                    dsn=dsn,
+                    min_size=2,
+                    max_size=20,
+                    init=PostgresDocumentDatabase._init_connection,
+                )
+                self._exit_stack.push_async_callback(pool.close)
+                _shared_pg_pools[dsn] = pool
+                return pool
+
+            async def make_postgres_db(dsn: str, name: str) -> DocumentDatabase:
+                from parlant.adapters.db.postgres_db import PostgresDocumentDatabase
+
+                pool = await _get_shared_pg_pool(dsn)
+
+                db = await self._exit_stack.enter_async_context(
+                    PostgresDocumentDatabase(
+                        dsn=dsn,
+                        logger=c()[Logger],
+                        table_prefix=name,
+                        pool=pool,
+                    )
+                )
+
+                return db
+
             async def make_persistable_store(t: type[T], spec: str, name: str, **kwargs: Any) -> T:
                 store: T
 
@@ -5255,11 +5267,27 @@ class Server:
                     )
 
                     return store
+                elif spec.startswith("postgresql://") or spec.startswith("postgres://"):
+                    store = await self._exit_stack.enter_async_context(
+                        t(
+                            database=await make_postgres_db(spec, name),
+                            allow_migration=self._migrate,
+                            **kwargs,
+                        )  # type: ignore
+                    )
+
+                    return store
                 else:
                     raise SDKError(
                         f"Invalid session store type: {self._session_store}. "
-                        "Expected 'transient', 'local', or a MongoDB connection string."
+                        "Expected 'transient', 'local', a MongoDB connection string, "
+                        "or a PostgreSQL connection string."
                     )
+
+            _pg_spec = self._session_store
+            _is_pg = isinstance(_pg_spec, str) and (
+                _pg_spec.startswith("postgresql://") or _pg_spec.startswith("postgres://")
+            )
 
             if isinstance(self._session_store, SessionStore):
                 c()[SessionStore] = self._session_store
@@ -5309,22 +5337,49 @@ class Server:
             async def get_embedder_type() -> type[Embedder]:
                 return type(await c()[NLPService].get_embedder())
 
-            for vector_store_interface, vector_store_type in [
-                (GlossaryStore, GlossaryVectorStore),
-                (CannedResponseStore, CannedResponseVectorStore),
-                (CapabilityStore, CapabilityVectorStore),
-                (JourneyStore, JourneyVectorStore),
+            _shared_pg_vector_db: VectorDatabase | None = None
+            if _is_pg:
+                from parlant.adapters.vector_db.pgvector import PostgresVectorDatabase
+
+                _pg_dsn = cast(str, _pg_spec)
+                _pg_pool = await _get_shared_pg_pool(_pg_dsn)
+
+                _shared_pg_vector_db = await self._exit_stack.enter_async_context(
+                    PostgresVectorDatabase(
+                        dsn=_pg_dsn,
+                        logger=c()[Logger],
+                        tracer=c()[Tracer],
+                        embedder_factory=embedder_factory,
+                        embedding_cache_provider=lambda: c()[EmbeddingCache],
+                        pool=_pg_pool,
+                    )
+                )
+
+            for vector_store_interface, vector_store_type, _doc_prefix in [
+                (GlossaryStore, GlossaryVectorStore, "glossary"),
+                (CannedResponseStore, CannedResponseVectorStore, "canned_responses"),
+                (CapabilityStore, CapabilityVectorStore, "capabilities"),
+                (JourneyStore, JourneyVectorStore, "journeys"),
             ]:
+                _vector_db: VectorDatabase
+                if _is_pg:
+                    assert _shared_pg_vector_db is not None
+                    _vector_db = _shared_pg_vector_db
+                    _document_db = await make_postgres_db(cast(str, _pg_spec), _doc_prefix)
+                else:
+                    _vector_db = TransientVectorDatabase(
+                        c()[Logger],
+                        c()[Tracer],
+                        embedder_factory,
+                        lambda: c()[EmbeddingCache],
+                    )
+                    _document_db = TransientDocumentDatabase()
+
                 c()[vector_store_interface] = await self._exit_stack.enter_async_context(
                     vector_store_type(
                         id_generator=c()[IdGenerator],
-                        vector_db=TransientVectorDatabase(
-                            c()[Logger],
-                            c()[Tracer],
-                            embedder_factory,
-                            lambda: c()[EmbeddingCache],
-                        ),
-                        document_db=TransientDocumentDatabase(),
+                        vector_db=_vector_db,
+                        document_db=_document_db,
                         embedder_factory=embedder_factory,
                         embedder_type_provider=get_embedder_type,
                     )  # type: ignore
@@ -5485,12 +5540,13 @@ __all__ = [
     "ModerationCheck",
     "ModerationService",
     "ModerationTag",
+    "MultiStepPlanner",
+    "MultiStepPlanSchema",
     "NLPService",
     "NLPServices",
     "NoMatchResponseProvider",
     "NoModeration",
     "NullPerceivedPerformancePolicy",
-    "NullPlan",
     "NullPlanner",
     "Operation",
     "OutputMode",

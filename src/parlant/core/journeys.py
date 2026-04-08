@@ -797,11 +797,14 @@ class JourneyVectorStore(JourneyStore):
         composition_mode_str = doc.get("composition_mode")
         composition_mode = CompositionMode(composition_mode_str) if composition_mode_str else None
 
+        raw_tools = doc["tools"]
+        tools = [t if isinstance(t, ToolId) else ToolId(*t) for t in raw_tools]
+
         return JourneyNode(
             id=JourneyNodeId(doc["node_id"]),
             creation_utc=datetime.fromisoformat(doc["creation_utc"]),
             action=doc["action"],
-            tools=doc["tools"],
+            tools=tools,
             metadata=doc["metadata"],
             description=doc.get("description"),
             composition_mode=composition_mode,

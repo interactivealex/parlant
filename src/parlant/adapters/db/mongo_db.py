@@ -214,7 +214,7 @@ class MongoDocumentCollection(DocumentCollection[TDocument]):
         # Calculate pagination metadata
         has_more = False
         next_cursor = None
-        total_count = len(items)
+        total_count = await self._collection.count_documents(query)
 
         if limit and len(items) > limit:
             has_more = True
