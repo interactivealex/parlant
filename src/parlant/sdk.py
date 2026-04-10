@@ -265,10 +265,6 @@ from parlant.core.engines.alpha.planners import (
     NullPlanner,
     PlannerProvider,
 )
-from parlant.core.engines.alpha.planning.basic_planner import (
-    MultiStepPlanner,
-    MultiStepPlanSchema,
-)
 from parlant.bin.server import PARLANT_HOME_DIR, start_parlant, StartupParameters
 from parlant.core.services.tools.plugins import PluginServer, ToolEntry, tool
 from parlant.core.tags import Tag as _Tag, TagDocumentStore, TagId, TagStore
@@ -5586,8 +5582,6 @@ __all__ = [
     "ModerationCheck",
     "ModerationService",
     "ModerationTag",
-    "MultiStepPlanner",
-    "MultiStepPlanSchema",
     "NLPService",
     "NLPServices",
     "NoMatchResponseProvider",
