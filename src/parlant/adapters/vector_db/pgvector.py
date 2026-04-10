@@ -1017,31 +1017,82 @@ class PostgresVectorCollection(Generic[TDocument], BaseVectorCollection[TDocumen
             translator = _VectorWhereTranslator()
             where_clause, sql_params = translator.translate(filters)
 
-            sql = f'SELECT doc_id, content, checksum, metadata FROM "{self._embedded_table}"'
+            select_sql = f'SELECT doc_id, content, checksum, metadata FROM "{self._embedded_table}"'
             if where_clause:
-                sql += f" WHERE {where_clause}"
-            sql += " LIMIT 1"
+                select_sql += f" WHERE {where_clause}"
 
-            # Phase 1: Read existing document (no transaction held)
-            row = await self._pool.fetchrow(sql, *sql_params)
+            # Phase 1: Unlocked pre-read to determine whether embedding is needed.
+            # This avoids holding a transaction open during external API calls.
+            row = await self._pool.fetchrow(select_sql + " LIMIT 1", *sql_params)
 
             if row is not None:
-                doc = PostgresVectorDatabase._row_to_document(row)
-                updated_document = cast(TDocument, {**doc, **params})
-
-                content = str(params.get("content", doc.get("content", "")))
-                metadata = {k: v for k, v in updated_document.items() if k not in ("content",)}
-                content_changed = "content" in params and content != doc.get("content", "")
+                pre_doc = PostgresVectorDatabase._row_to_document(row)
+                pre_content = str(params.get("content", pre_doc.get("content", "")))
+                content_changed = "content" in params and pre_content != pre_doc.get("content", "")
 
                 # Phase 2: Compute embedding OUTSIDE transaction to avoid
                 # holding a connection during external API calls.
                 embedding: Optional[Sequence[float]] = None
                 if content_changed:
-                    embedding = await self._get_embedding(content)
+                    embedding = await self._get_embedding(pre_content)
 
-                # Phase 3: Write both tables atomically in a single transaction.
+                # Phase 3: Re-read with FOR UPDATE inside a transaction to
+                # ensure atomicity, then merge and write both tables.
                 async with self._pool.acquire() as conn:
                     async with conn.transaction():
+                        locked_row = await conn.fetchrow(
+                            select_sql + " FOR UPDATE LIMIT 1", *sql_params
+                        )
+
+                        if locked_row is None:
+                            # Row was deleted between pre-read and lock
+                            if upsert:
+                                ensure_is_total(params, self._schema)
+                                upsert_content = params["content"]
+                                upsert_metadata = {
+                                    k: v for k, v in params.items() if k not in ("content",)
+                                }
+                                upsert_embedding = await self._get_embedding(upsert_content)
+                                await self._upsert_document(
+                                    conn,
+                                    params["id"],
+                                    upsert_content,
+                                    str(params.get("checksum", "")),
+                                    upsert_metadata,
+                                    upsert_embedding,
+                                )
+                                return UpdateResult(
+                                    acknowledged=True,
+                                    matched_count=0,
+                                    modified_count=0,
+                                    updated_document=params,
+                                )
+                            return UpdateResult(
+                                acknowledged=True,
+                                matched_count=0,
+                                modified_count=0,
+                                updated_document=None,
+                            )
+
+                        # Merge params onto the fresh locked read
+                        doc = PostgresVectorDatabase._row_to_document(locked_row)
+                        updated_document = cast(TDocument, {**doc, **params})
+
+                        content = str(params.get("content", doc.get("content", "")))
+                        metadata = {
+                            k: v for k, v in updated_document.items() if k not in ("content",)
+                        }
+
+                        # Re-check if content actually changed against the locked row
+                        real_content_changed = "content" in params and content != doc.get(
+                            "content", ""
+                        )
+
+                        # Re-embed if content changed but our pre-computed embedding
+                        # was based on different content (concurrent modification)
+                        if real_content_changed and (not content_changed or content != pre_content):
+                            embedding = await self._get_embedding(content)
+
                         await conn.execute(
                             f"""
                             UPDATE "{self._unembedded_table}"
@@ -1054,7 +1105,7 @@ class PostgresVectorCollection(Generic[TDocument], BaseVectorCollection[TDocumen
                             doc["id"],
                         )
 
-                        if content_changed:
+                        if real_content_changed:
                             assert embedding is not None
                             await conn.execute(
                                 f"""

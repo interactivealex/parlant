@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -611,16 +612,25 @@ class PostgresDocumentCollection(DocumentCollection[TDocument]):
         # Query one extra to detect has_more
         query_limit = (limit + 1) if limit is not None else None
 
-        # Use COUNT(*) OVER() window function to get total count in a single query
-        sql = f'SELECT "id", "version", "creation_utc", data, COUNT(*) OVER() AS _total FROM "{self._table}"'
+        # Fetch matching rows
+        sql = f'SELECT "id", "version", "creation_utc", data FROM "{self._table}"'
         if where_clause:
             sql += f" WHERE {where_clause}"
         sql += f" ORDER BY {order_by}"
         if query_limit is not None:
             sql += f" LIMIT {query_limit}"
 
-        rows = await self._pool.fetch(sql, *params)
-        total_count = int(rows[0]["_total"]) if rows else 0
+        # Separate COUNT query for correct total (window functions see only LIMITed rows)
+        count_sql = f'SELECT COUNT(*) AS cnt FROM "{self._table}"'
+        if where_clause:
+            count_sql += f" WHERE {where_clause}"
+
+        rows, count_row = await asyncio.gather(
+            self._pool.fetch(sql, *params),
+            self._pool.fetchrow(count_sql, *params),
+        )
+
+        total_count = int(count_row["cnt"]) if count_row else 0
         items = [PostgresDocumentDatabase._row_to_document(r) for r in rows]
 
         has_more = False
