@@ -175,6 +175,11 @@ class MongoDocumentCollection(DocumentCollection[TDocument]):
         query = dict(filters) if filters else {}
         sort_direction = sort_direction or SortDirection.ASC
 
+        # Snapshot the base query before cursor conditions are added.
+        # total_count must reflect ALL matching documents, not just
+        # the remaining ones from the current cursor position.
+        base_query = dict(query)
+
         if cursor is not None:
             if sort_direction == SortDirection.DESC:
                 cursor_conditions = [
@@ -214,7 +219,7 @@ class MongoDocumentCollection(DocumentCollection[TDocument]):
         # Calculate pagination metadata
         has_more = False
         next_cursor = None
-        total_count = await self._collection.count_documents(query)
+        total_count = await self._collection.count_documents(base_query)
 
         if limit and len(items) > limit:
             has_more = True

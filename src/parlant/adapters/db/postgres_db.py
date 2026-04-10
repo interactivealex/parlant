@@ -577,6 +577,12 @@ class PostgresDocumentCollection(DocumentCollection[TDocument]):
         translator = _WhereTranslator()
         where_clause, params = translator.translate(filters)
 
+        # Snapshot the filter-only clause for the COUNT query.
+        # Cursor conditions narrow the result window but total_count
+        # must reflect ALL documents matching the base filter.
+        base_where_clause = where_clause
+        base_params = list(params)
+
         if cursor is not None:
             # Continue parameter numbering from the WHERE translation
             cursor_translator = _WhereTranslator()
@@ -620,14 +626,16 @@ class PostgresDocumentCollection(DocumentCollection[TDocument]):
         if query_limit is not None:
             sql += f" LIMIT {query_limit}"
 
-        # Separate COUNT query for correct total (window functions see only LIMITed rows)
+        # Separate COUNT query using the base filter (without cursor conditions)
+        # so that total_count reflects ALL matching documents, not just the
+        # remaining ones from the current cursor position.
         count_sql = f'SELECT COUNT(*) AS cnt FROM "{self._table}"'
-        if where_clause:
-            count_sql += f" WHERE {where_clause}"
+        if base_where_clause:
+            count_sql += f" WHERE {base_where_clause}"
 
         rows, count_row = await asyncio.gather(
             self._pool.fetch(sql, *params),
-            self._pool.fetchrow(count_sql, *params),
+            self._pool.fetchrow(count_sql, *base_params),
         )
 
         total_count = int(count_row["cnt"]) if count_row else 0
