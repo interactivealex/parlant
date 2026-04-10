@@ -5193,8 +5193,15 @@ class Server:
                 return db
 
             _shared_pg_pools: dict[str, Any] = {}
+            _shared_pg_vector_pools: dict[str, Any] = {}
+
+            _pg_server_settings = {
+                "statement_timeout": "30000",
+                "lock_timeout": "10000",
+            }
 
             async def _get_shared_pg_pool(dsn: str) -> Any:
+                """Get or create a shared asyncpg pool for document stores (no pgvector)."""
                 nonlocal _shared_pg_pools
 
                 if dsn in _shared_pg_pools:
@@ -5205,6 +5212,34 @@ class Server:
                         "PostgreSQL requires additional packages to be installed. "
                         "Please install parlant[postgres] to use PostgreSQL."
                     )
+
+                import asyncpg  # type: ignore[import-untyped, import-not-found]
+
+                from parlant.adapters.db.postgres_db import PostgresDocumentDatabase
+
+                pool = await asyncpg.create_pool(
+                    dsn=dsn,
+                    min_size=2,
+                    max_size=20,
+                    init=PostgresDocumentDatabase._init_connection,
+                    server_settings=_pg_server_settings,
+                    command_timeout=30.0,
+                )
+                self._exit_stack.push_async_callback(pool.close)
+                _shared_pg_pools[dsn] = pool
+                return pool
+
+            async def _get_shared_pg_vector_pool(dsn: str) -> Any:
+                """Get or create a shared asyncpg pool with pgvector support.
+
+                Creates a separate pool from the plain document pool because
+                vector-aware connections require the pgvector extension and
+                register_vector() on each connection.
+                """
+                nonlocal _shared_pg_vector_pools
+
+                if dsn in _shared_pg_vector_pools:
+                    return _shared_pg_vector_pools[dsn]
 
                 import asyncpg  # type: ignore[import-untyped, import-not-found]
 
@@ -5219,19 +5254,16 @@ class Server:
                 finally:
                     await bootstrap_conn.close()
 
-                async def _combined_pg_init(conn: Any) -> None:
-                    """Register both JSON codec and pgvector types on every new connection."""
-                    await PostgresVectorDatabase._init_connection(conn)
-
                 pool = await asyncpg.create_pool(
                     dsn=dsn,
                     min_size=2,
                     max_size=20,
-                    init=_combined_pg_init,
+                    init=PostgresVectorDatabase._init_connection,
+                    server_settings=_pg_server_settings,
                     command_timeout=30.0,
                 )
                 self._exit_stack.push_async_callback(pool.close)
-                _shared_pg_pools[dsn] = pool
+                _shared_pg_vector_pools[dsn] = pool
                 return pool
 
             async def make_postgres_db(dsn: str, name: str) -> DocumentDatabase:
@@ -5356,7 +5388,7 @@ class Server:
                 from parlant.adapters.vector_db.pgvector import PostgresVectorDatabase
 
                 _pg_dsn = cast(str, _pg_spec)
-                _pg_pool = await _get_shared_pg_pool(_pg_dsn)
+                _pg_vector_pool = await _get_shared_pg_vector_pool(_pg_dsn)
 
                 _shared_pg_vector_db = await self._exit_stack.enter_async_context(
                     PostgresVectorDatabase(
@@ -5365,7 +5397,7 @@ class Server:
                         tracer=c()[Tracer],
                         embedder_factory=embedder_factory,
                         embedding_cache_provider=lambda: c()[EmbeddingCache],
-                        pool=_pg_pool,
+                        pool=_pg_vector_pool,
                     )
                 )
 
