@@ -133,10 +133,14 @@ class _VectorWhereTranslator:
 
         return " AND ".join(parts) if parts else "TRUE"
 
+    _VALID_FIELD_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
     def _translate_expression(self, expr: WhereExpression) -> str:
         clauses: list[str] = []
 
         for field_name, field_filter in expr.items():
+            if not self._VALID_FIELD_RE.match(field_name):
+                raise ValueError(f"Invalid field name: {field_name!r}")
             column = self.INDEXED_FIELDS.get(field_name)
             is_indexed = column is not None
             ref = f'"{column}"' if is_indexed else f"metadata->'{field_name}'"
@@ -219,6 +223,7 @@ class PostgresVectorDatabase(VectorDatabase):
         pool: Optional[asyncpg.Pool[asyncpg.Record]] = None,
         statement_timeout_ms: int = 30_000,
         lock_timeout_ms: int = 10_000,
+        command_timeout: float = 30.0,
     ) -> None:
         self._dsn = dsn
         self._logger = logger
@@ -229,6 +234,7 @@ class PostgresVectorDatabase(VectorDatabase):
         self._external_pool = pool
         self._pool: Optional[asyncpg.Pool[asyncpg.Record]] = None
         self._collections: dict[str, PostgresVectorCollection[BaseDocument]] = {}
+        self._command_timeout = command_timeout
         self._server_settings = {
             "statement_timeout": str(statement_timeout_ms),
             "lock_timeout": str(lock_timeout_ms),
@@ -237,15 +243,15 @@ class PostgresVectorDatabase(VectorDatabase):
     async def __aenter__(self) -> Self:
         if self._external_pool is not None:
             self._pool = self._external_pool
-            # Ensure pgvector extension exists and register vector types on
-            # connections from the shared pool (which only has JSON codec).
+            # Ensure pgvector extension exists (idempotent safety net).
+            # Vector type registration is handled by the pool's init callback
+            # (e.g. _combined_pg_init in sdk.py), which runs on every new connection.
             await self._pool.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            await self._register_vector_on_pool(self._pool)
         else:
             # Create the pgvector extension BEFORE creating the pool, because
             # _init_connection calls register_vector() which requires the
             # extension's types to already exist in pg_catalog.
-            bootstrap_conn = await asyncpg.connect(dsn=self._dsn)
+            bootstrap_conn = await asyncpg.connect(dsn=self._dsn, command_timeout=60.0)
             try:
                 await bootstrap_conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             finally:
@@ -257,6 +263,7 @@ class PostgresVectorDatabase(VectorDatabase):
                 max_size=10,
                 init=self._init_connection,
                 server_settings=self._server_settings,
+                command_timeout=self._command_timeout,
             )
         # Ensure metadata table exists
         await self._pool.execute("""
@@ -292,14 +299,14 @@ class PostgresVectorDatabase(VectorDatabase):
 
     @staticmethod
     async def _register_vector_on_pool(pool: asyncpg.Pool[asyncpg.Record]) -> None:
-        """Register pgvector types on all existing connections in a shared pool.
+        """Register pgvector types on a single connection from the pool.
 
-        When using a shared pool whose init callback only sets JSON codec,
-        this ensures vector types are available on already-open connections.
+        Useful for pools created without a vector-aware init callback
+        (e.g. in test fixtures). For production use with a shared pool
+        whose init callback includes register_vector(), this is not needed.
         """
         from pgvector.asyncpg import register_vector  # type: ignore[import-untyped]
 
-        # Register on the current idle connections by acquiring and releasing them
         async with pool.acquire() as conn:
             await register_vector(conn)
 
@@ -307,6 +314,8 @@ class PostgresVectorDatabase(VectorDatabase):
         if self._pool is None:
             raise RuntimeError("Database pool not initialized. Use async with.")
         return self._pool
+
+    _PG_MAX_IDENTIFIER = 63
 
     @staticmethod
     def _table_name(collection_name: str, suffix: str = "") -> str:
@@ -316,6 +325,10 @@ class PostgresVectorDatabase(VectorDatabase):
 
         if not re.match(r"^[a-zA-Z0-9_]+$", result):
             raise ValueError(f"Invalid table name: {result}")
+
+        if len(result) > PostgresVectorDatabase._PG_MAX_IDENTIFIER:
+            name_hash = hashlib.md5(result.encode()).hexdigest()[:6]
+            result = f"{result[: PostgresVectorDatabase._PG_MAX_IDENTIFIER - 7]}_{name_hash}"
 
         return result
 
@@ -374,6 +387,8 @@ class PostgresVectorDatabase(VectorDatabase):
                 USING hnsw (embedding halfvec_cosine_ops)
             """)
 
+    _SYNC_BATCH_SIZE = 500
+
     async def _sync_embedded_with_unembedded(
         self,
         unembedded_table: str,
@@ -382,134 +397,135 @@ class PostgresVectorDatabase(VectorDatabase):
     ) -> None:
         """Ensure embedded table is in sync with unembedded table (source of truth).
 
-        Uses two transaction phases:
-        - Phase 1 (REPEATABLE READ): Delete orphans + read diffs for a consistent snapshot.
-        - Phase 2: Embed content (external API call, outside any transaction).
-        - Phase 3: Write updates/inserts in a single transaction for atomicity.
+        Processes diffs in batches to keep memory bounded:
+        1. Delete orphaned embedded docs in batches.
+        2. Read diffs (new, changed, metadata-only) in batches using keyset pagination.
+        3. For each batch: embed content outside transaction, write atomically.
         """
         pool = self._get_pool()
 
-        # Phase 1: Consistent snapshot — delete orphans and read diffs
-        async with pool.acquire() as conn:
-            async with conn.transaction(isolation="repeatable_read"):
-                # Batch remove orphaned embedded docs (NOT EXISTS enables hash anti-join)
-                await conn.execute(
-                    f"""
-                    DELETE FROM "{embedded_table}" e
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM "{unembedded_table}" u WHERE u.doc_id = e.doc_id
-                    )
-                    """
+        # Phase 1: Delete orphans in batches
+        while True:
+            result = await pool.execute(
+                f"""
+                DELETE FROM "{embedded_table}" e
+                WHERE e.doc_id IN (
+                    SELECT e2.doc_id FROM "{embedded_table}" e2
+                    LEFT JOIN "{unembedded_table}" u ON u.doc_id = e2.doc_id
+                    WHERE u.doc_id IS NULL
+                    LIMIT {self._SYNC_BATCH_SIZE}
                 )
+                """
+            )
+            # asyncpg execute() returns the PG command tag, e.g. "DELETE 5"
+            deleted_count = int(result.split()[-1])
+            if deleted_count < self._SYNC_BATCH_SIZE:
+                break
 
-                # Batch find rows with changed checksums
-                changed_rows = await conn.fetch(
-                    f"""
-                    SELECT u.doc_id, u.content, u.checksum, u.metadata
-                    FROM "{unembedded_table}" u
-                    JOIN "{embedded_table}" e ON u.doc_id = e.doc_id
-                    WHERE u.checksum != e.checksum
-                    """
-                )
+        # Phase 2+3: Read diffs, embed, and write in batches
+        last_id = ""
+        while True:
+            # Read a batch of diffs with consistent classification
+            diff_rows = await pool.fetch(
+                f"""
+                SELECT u.doc_id, u.content, u.checksum, u.metadata,
+                       CASE
+                           WHEN e.doc_id IS NULL THEN 'new'
+                           WHEN u.checksum != e.checksum THEN 'changed'
+                           WHEN u.metadata IS DISTINCT FROM e.metadata THEN 'metadata_only'
+                       END AS change_type
+                FROM "{unembedded_table}" u
+                LEFT JOIN "{embedded_table}" e ON u.doc_id = e.doc_id
+                WHERE (e.doc_id IS NULL
+                   OR u.checksum != e.checksum
+                   OR (u.checksum = e.checksum
+                       AND u.metadata IS DISTINCT FROM e.metadata))
+                  AND u.doc_id > $1
+                ORDER BY u.doc_id
+                LIMIT {self._SYNC_BATCH_SIZE}
+                """,
+                last_id,
+            )
 
-                # Batch find new rows (exist in unembedded but not in embedded)
-                new_rows = await conn.fetch(
-                    f"""
-                    SELECT u.doc_id, u.content, u.checksum, u.metadata
-                    FROM "{unembedded_table}" u
-                    LEFT JOIN "{embedded_table}" e ON u.doc_id = e.doc_id
-                    WHERE e.doc_id IS NULL
-                    """
-                )
+            if not diff_rows:
+                break
+            last_id = diff_rows[-1]["doc_id"]
 
-                # Batch find rows where only metadata changed (same checksum, different metadata)
-                metadata_changed_rows = await conn.fetch(
-                    f"""
-                    SELECT u.doc_id, u.content, u.checksum, u.metadata
-                    FROM "{unembedded_table}" u
-                    JOIN "{embedded_table}" e ON u.doc_id = e.doc_id
-                    WHERE u.checksum = e.checksum
-                      AND u.metadata IS DISTINCT FROM e.metadata
-                    """
-                )
+            metadata_only_rows = [r for r in diff_rows if r["change_type"] == "metadata_only"]
+            changed_rows = [r for r in diff_rows if r["change_type"] == "changed"]
+            new_rows = [r for r in diff_rows if r["change_type"] == "new"]
+            rows_to_embed = changed_rows + new_rows
 
-        # Phase 2: Embed content (external API call — outside any transaction)
-        all_rows_to_embed = list(changed_rows) + list(new_rows)
-        all_vectors: Sequence[Sequence[float]] = []
-        if all_rows_to_embed:
-            contents = [row["content"] for row in all_rows_to_embed]
-            all_vectors = (await embedder.embed(contents)).vectors
+            # Embed outside any transaction to avoid holding connections during API calls
+            all_vectors: Sequence[Sequence[float]] = []
+            if rows_to_embed:
+                contents = [row["content"] for row in rows_to_embed]
+                all_vectors = (await embedder.embed(contents)).vectors
 
-        # Phase 3: Write all changes in a single transaction for atomicity
-        has_writes = metadata_changed_rows or changed_rows or new_rows
-        if not has_writes:
-            return
-
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                if metadata_changed_rows:
-                    update_args = [
-                        (
-                            dict(row["metadata"])
-                            if isinstance(row["metadata"], dict)
-                            else row["metadata"],
-                            row["doc_id"],
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    if metadata_only_rows:
+                        update_args = [
+                            (
+                                dict(row["metadata"])
+                                if isinstance(row["metadata"], dict)
+                                else row["metadata"],
+                                row["doc_id"],
+                            )
+                            for row in metadata_only_rows
+                        ]
+                        await conn.executemany(
+                            f'UPDATE "{embedded_table}" SET metadata = $1::jsonb WHERE doc_id = $2',
+                            update_args,
                         )
-                        for row in metadata_changed_rows
-                    ]
-                    await conn.executemany(
-                        f'UPDATE "{embedded_table}" SET metadata = $1::jsonb WHERE doc_id = $2',
-                        update_args,
-                    )
 
-                # Batch UPDATE changed rows
-                if changed_rows:
-                    changed_args = [
-                        (
-                            row["content"],
-                            row["checksum"],
-                            dict(row["metadata"])
-                            if isinstance(row["metadata"], dict)
-                            else row["metadata"],
-                            HalfVector(all_vectors[i]),
-                            row["doc_id"],
+                    vec_idx = 0
+                    if changed_rows:
+                        changed_args = [
+                            (
+                                row["content"],
+                                row["checksum"],
+                                dict(row["metadata"])
+                                if isinstance(row["metadata"], dict)
+                                else row["metadata"],
+                                HalfVector(all_vectors[vec_idx + i]),
+                                row["doc_id"],
+                            )
+                            for i, row in enumerate(changed_rows)
+                        ]
+                        await conn.executemany(
+                            f"""
+                            UPDATE "{embedded_table}"
+                            SET content = $1, checksum = $2, metadata = $3::jsonb, embedding = $4
+                            WHERE doc_id = $5
+                            """,
+                            changed_args,
                         )
-                        for i, row in enumerate(changed_rows)
-                    ]
-                    await conn.executemany(
-                        f"""
-                        UPDATE "{embedded_table}"
-                        SET content = $1, checksum = $2, metadata = $3::jsonb, embedding = $4
-                        WHERE doc_id = $5
-                        """,
-                        changed_args,
-                    )
+                        vec_idx += len(changed_rows)
 
-                # Batch INSERT new rows
-                if new_rows:
-                    offset = len(changed_rows)
-                    insert_args = [
-                        (
-                            row["doc_id"],
-                            row["content"],
-                            row["checksum"],
-                            dict(row["metadata"])
-                            if isinstance(row["metadata"], dict)
-                            else row["metadata"],
-                            HalfVector(all_vectors[offset + i]),
+                    if new_rows:
+                        insert_args = [
+                            (
+                                row["doc_id"],
+                                row["content"],
+                                row["checksum"],
+                                dict(row["metadata"])
+                                if isinstance(row["metadata"], dict)
+                                else row["metadata"],
+                                HalfVector(all_vectors[vec_idx + i]),
+                            )
+                            for i, row in enumerate(new_rows)
+                        ]
+                        await conn.executemany(
+                            f"""
+                            INSERT INTO "{embedded_table}" (doc_id, content, checksum, metadata, embedding)
+                            VALUES ($1, $2, $3, $4::jsonb, $5)
+                            ON CONFLICT (doc_id) DO UPDATE
+                            SET content = EXCLUDED.content, checksum = EXCLUDED.checksum,
+                                metadata = EXCLUDED.metadata, embedding = EXCLUDED.embedding
+                            """,
+                            insert_args,
                         )
-                        for i, row in enumerate(new_rows)
-                    ]
-                    await conn.executemany(
-                        f"""
-                        INSERT INTO "{embedded_table}" (doc_id, content, checksum, metadata, embedding)
-                        VALUES ($1, $2, $3, $4::jsonb, $5)
-                        ON CONFLICT (doc_id) DO UPDATE
-                        SET content = EXCLUDED.content, checksum = EXCLUDED.checksum,
-                            metadata = EXCLUDED.metadata, embedding = EXCLUDED.embedding
-                        """,
-                        insert_args,
-                    )
 
     @staticmethod
     def _advisory_lock_id(table: str) -> int:
@@ -519,6 +535,7 @@ class PostgresVectorDatabase(VectorDatabase):
 
     async def _load_and_migrate_documents(
         self,
+        collection_name: str,
         unembedded_table: str,
         embedded_table: str,
         embedder_type: type[Embedder],
@@ -536,7 +553,12 @@ class PostgresVectorDatabase(VectorDatabase):
             await lock_conn.execute("SELECT pg_advisory_lock($1)", lock_id)
             try:
                 await self._do_load_and_migrate(
-                    pool, unembedded_table, embedded_table, embedder, document_loader
+                    pool,
+                    collection_name,
+                    unembedded_table,
+                    embedded_table,
+                    embedder,
+                    document_loader,
                 )
             finally:
                 await lock_conn.execute("SELECT pg_advisory_unlock($1)", lock_id)
@@ -546,6 +568,7 @@ class PostgresVectorDatabase(VectorDatabase):
     async def _do_load_and_migrate(
         self,
         pool: asyncpg.Pool[asyncpg.Record],
+        collection_name: str,
         unembedded_table: str,
         embedded_table: str,
         embedder: Embedder,
@@ -553,48 +576,105 @@ class PostgresVectorDatabase(VectorDatabase):
     ) -> None:
         """Inner migration logic (must be called under advisory lock).
 
-        Streams rows in batches via a server-side cursor to avoid loading
-        the entire collection into memory.
+        Processes rows in batches using keyset pagination to keep memory bounded.
+        Failed documents are moved to a dedicated failed_migrations table
+        instead of being silently deleted.
         """
-        # Fetch documents in batches to avoid loading entire collection into memory.
-        all_docs: list[BaseDocument] = []
-        offset = 0
+        failed_table = self._table_name(collection_name, "failed_migrations")
+
+        # Drop old failed_migrations table from previous runs
+        if await self._table_exists(failed_table):
+            self._logger.info(f"Deleting old `{failed_table}` table")
+            await pool.execute(f'DROP TABLE IF EXISTS "{failed_table}"')
+
+        failed_table_created = False
+
+        last_id = ""
         while True:
             batch = await pool.fetch(
                 f'SELECT doc_id, content, checksum, metadata FROM "{unembedded_table}" '
-                f"ORDER BY doc_id LIMIT {self._MIGRATION_BATCH_SIZE} OFFSET {offset}",
+                f"WHERE doc_id > $1 ORDER BY doc_id LIMIT {self._MIGRATION_BATCH_SIZE}",
+                last_id,
             )
             if not batch:
                 break
-            all_docs.extend(self._row_to_document(row) for row in batch)
-            offset += len(batch)
+            last_id = batch[-1]["doc_id"]
 
-        for doc in all_docs:
-            try:
-                if loaded_doc := await document_loader(doc):
-                    if loaded_doc != doc:
-                        metadata = {k: v for k, v in loaded_doc.items() if k not in ("content",)}
-                        await pool.execute(
-                            f"""
-                            UPDATE "{unembedded_table}"
-                            SET content = $1, checksum = $2, metadata = $3::jsonb
-                            WHERE doc_id = $4
-                            """,
-                            loaded_doc.get("content", ""),
-                            loaded_doc.get("checksum", ""),
-                            metadata,
-                            loaded_doc["id"],
+            for row in batch:
+                doc = self._row_to_document(row)
+                try:
+                    if loaded_doc := await document_loader(doc):
+                        if loaded_doc != doc:
+                            metadata = {
+                                k: v for k, v in loaded_doc.items() if k not in ("content",)
+                            }
+                            await pool.execute(
+                                f"""
+                                UPDATE "{unembedded_table}"
+                                SET content = $1, checksum = $2, metadata = $3::jsonb
+                                WHERE doc_id = $4
+                                """,
+                                loaded_doc.get("content", ""),
+                                loaded_doc.get("checksum", ""),
+                                metadata,
+                                loaded_doc["id"],
+                            )
+                    else:
+                        self._logger.warning(f'Failed to load document "{doc}"')
+                        failed_table_created = await self._handle_failed_migration(
+                            pool, failed_table, unembedded_table, doc, failed_table_created
                         )
-                else:
-                    self._logger.warning(f'Failed to load document "{doc}"')
-                    await pool.execute(
-                        f'DELETE FROM "{unembedded_table}" WHERE doc_id = $1', doc["id"]
+
+                except Exception as e:
+                    self._logger.error(
+                        f"Failed to load document '{doc}' with error: {e}. "
+                        f"Added to `{failed_table}` table."
                     )
-            except Exception as e:
-                self._logger.error(f"Failed to load document '{doc}' with error: {e}.")
+                    failed_table_created = await self._handle_failed_migration(
+                        pool, failed_table, unembedded_table, doc, failed_table_created
+                    )
 
         # Now sync embedded table
         await self._sync_embedded_with_unembedded(unembedded_table, embedded_table, embedder)
+
+    async def _handle_failed_migration(
+        self,
+        pool: asyncpg.Pool[asyncpg.Record],
+        failed_table: str,
+        source_table: str,
+        doc: BaseDocument,
+        failed_table_created: bool,
+    ) -> bool:
+        """Ensure the failed migrations table exists and move the document into it."""
+        if not failed_table_created:
+            self._logger.warning(f"Creating `{failed_table}` table to store failed migrations...")
+            await self._create_unembedded_table(failed_table)
+        await self._move_to_failed_table(pool, failed_table, source_table, doc)
+        return True
+
+    async def _move_to_failed_table(
+        self,
+        pool: asyncpg.Pool[asyncpg.Record],
+        failed_table: str,
+        source_table: str,
+        doc: BaseDocument,
+    ) -> None:
+        """Move a document from the source table to the failed migrations table."""
+        metadata = {k: v for k, v in doc.items() if k not in ("content", "checksum")}
+        await pool.execute(
+            f"""
+            INSERT INTO "{failed_table}" (doc_id, content, checksum, metadata)
+            VALUES ($1, $2, $3, $4::jsonb)
+            ON CONFLICT (doc_id) DO UPDATE
+            SET content = EXCLUDED.content, checksum = EXCLUDED.checksum,
+                metadata = EXCLUDED.metadata
+            """,
+            doc["id"],
+            doc.get("content", ""),
+            doc.get("checksum", ""),
+            metadata,
+        )
+        await pool.execute(f'DELETE FROM "{source_table}" WHERE doc_id = $1', doc["id"])
 
     @override
     async def create_collection(
@@ -653,7 +733,7 @@ class PostgresVectorDatabase(VectorDatabase):
 
         # Load/migrate documents and sync
         await self._load_and_migrate_documents(
-            unembedded_table, embedded_table, embedder_type, document_loader
+            name, unembedded_table, embedded_table, embedder_type, document_loader
         )
 
         collection_obj = PostgresVectorCollection[TDocument](
@@ -691,7 +771,7 @@ class PostgresVectorDatabase(VectorDatabase):
 
         # Load/migrate documents and sync
         await self._load_and_migrate_documents(
-            unembedded_table, embedded_table, embedder_type, document_loader
+            name, unembedded_table, embedded_table, embedder_type, document_loader
         )
 
         collection_obj = PostgresVectorCollection[TDocument](
@@ -807,6 +887,47 @@ class PostgresVectorCollection(Generic[TDocument], BaseVectorCollection[TDocumen
 
         self._lock = ReaderWriterLock()
 
+    async def _upsert_document(
+        self,
+        conn: asyncpg.Connection[asyncpg.Record],
+        doc_id: str,
+        content: str,
+        checksum: str,
+        metadata: dict[str, Any],
+        embedding: Sequence[float],
+    ) -> None:
+        """Upsert a document into both unembedded and embedded tables."""
+        await conn.execute(
+            f"""
+            INSERT INTO "{self._unembedded_table}" (doc_id, content, checksum, metadata)
+            VALUES ($1, $2, $3, $4::jsonb)
+            ON CONFLICT (doc_id) DO UPDATE
+            SET content = EXCLUDED.content,
+                checksum = EXCLUDED.checksum,
+                metadata = EXCLUDED.metadata
+            """,
+            doc_id,
+            content,
+            checksum,
+            metadata,
+        )
+        await conn.execute(
+            f"""
+            INSERT INTO "{self._embedded_table}" (doc_id, content, checksum, metadata, embedding)
+            VALUES ($1, $2, $3, $4::jsonb, $5)
+            ON CONFLICT (doc_id) DO UPDATE
+            SET content = EXCLUDED.content,
+                checksum = EXCLUDED.checksum,
+                metadata = EXCLUDED.metadata,
+                embedding = EXCLUDED.embedding
+            """,
+            doc_id,
+            content,
+            checksum,
+            metadata,
+            HalfVector(embedding),
+        )
+
     async def _get_embedding(self, content: str) -> Sequence[float]:
         """Get embedding from cache or compute it."""
         if e := await self._embedding_cache_provider().get(
@@ -874,38 +995,13 @@ class PostgresVectorCollection(Generic[TDocument], BaseVectorCollection[TDocumen
         async with self._lock.writer_lock:
             async with self._pool.acquire() as conn:
                 async with conn.transaction():
-                    # Insert into unembedded table (upsert for restart-safety)
-                    await conn.execute(
-                        f"""
-                        INSERT INTO "{self._unembedded_table}" (doc_id, content, checksum, metadata)
-                        VALUES ($1, $2, $3, $4::jsonb)
-                        ON CONFLICT (doc_id) DO UPDATE
-                        SET content = EXCLUDED.content,
-                            checksum = EXCLUDED.checksum,
-                            metadata = EXCLUDED.metadata
-                        """,
+                    await self._upsert_document(
+                        conn,
                         document["id"],
                         content,
-                        document.get("checksum", ""),
+                        str(document.get("checksum", "")),
                         metadata,
-                    )
-
-                    # Insert into embedded table with vector (upsert for restart-safety)
-                    await conn.execute(
-                        f"""
-                        INSERT INTO "{self._embedded_table}" (doc_id, content, checksum, metadata, embedding)
-                        VALUES ($1, $2, $3, $4::jsonb, $5)
-                        ON CONFLICT (doc_id) DO UPDATE
-                        SET content = EXCLUDED.content,
-                            checksum = EXCLUDED.checksum,
-                            metadata = EXCLUDED.metadata,
-                            embedding = EXCLUDED.embedding
-                        """,
-                        document["id"],
-                        content,
-                        document.get("checksum", ""),
-                        metadata,
-                        HalfVector(embedding),
+                        embedding,
                     )
 
         return InsertResult(acknowledged=True)
@@ -935,11 +1031,15 @@ class PostgresVectorCollection(Generic[TDocument], BaseVectorCollection[TDocumen
 
                 content = str(params.get("content", doc.get("content", "")))
                 metadata = {k: v for k, v in updated_document.items() if k not in ("content",)}
+                content_changed = "content" in params and content != doc.get("content", "")
 
-                # Phase 2: Compute embedding outside any transaction
-                embedding = await self._get_embedding(content)
+                # Phase 2: Compute embedding OUTSIDE transaction to avoid
+                # holding a connection during external API calls.
+                embedding: Optional[Sequence[float]] = None
+                if content_changed:
+                    embedding = await self._get_embedding(content)
 
-                # Phase 3: Write in a single transaction (upsert for safety)
+                # Phase 3: Write both tables atomically in a single transaction.
                 async with self._pool.acquire() as conn:
                     async with conn.transaction():
                         await conn.execute(
@@ -954,18 +1054,32 @@ class PostgresVectorCollection(Generic[TDocument], BaseVectorCollection[TDocumen
                             doc["id"],
                         )
 
-                        await conn.execute(
-                            f"""
-                            UPDATE "{self._embedded_table}"
-                            SET content = $1, checksum = $2, metadata = $3::jsonb, embedding = $4
-                            WHERE doc_id = $5
-                            """,
-                            content,
-                            updated_document.get("checksum", ""),
-                            metadata,
-                            HalfVector(embedding),
-                            doc["id"],
-                        )
+                        if content_changed:
+                            assert embedding is not None
+                            await conn.execute(
+                                f"""
+                                UPDATE "{self._embedded_table}"
+                                SET content = $1, checksum = $2, metadata = $3::jsonb, embedding = $4
+                                WHERE doc_id = $5
+                                """,
+                                content,
+                                updated_document.get("checksum", ""),
+                                metadata,
+                                HalfVector(embedding),
+                                doc["id"],
+                            )
+                        else:
+                            await conn.execute(
+                                f"""
+                                UPDATE "{self._embedded_table}"
+                                SET content = $1, checksum = $2, metadata = $3::jsonb
+                                WHERE doc_id = $4
+                                """,
+                                content,
+                                updated_document.get("checksum", ""),
+                                metadata,
+                                doc["id"],
+                            )
 
                 return UpdateResult(
                     acknowledged=True,
@@ -980,41 +1094,17 @@ class PostgresVectorCollection(Generic[TDocument], BaseVectorCollection[TDocumen
                 content = params["content"]
                 metadata = {k: v for k, v in params.items() if k not in ("content",)}
 
-                # Compute embedding outside any transaction
                 embedding = await self._get_embedding(content)
 
                 async with self._pool.acquire() as conn:
                     async with conn.transaction():
-                        await conn.execute(
-                            f"""
-                            INSERT INTO "{self._unembedded_table}" (doc_id, content, checksum, metadata)
-                            VALUES ($1, $2, $3, $4::jsonb)
-                            ON CONFLICT (doc_id) DO UPDATE
-                            SET content = EXCLUDED.content,
-                                checksum = EXCLUDED.checksum,
-                                metadata = EXCLUDED.metadata
-                            """,
+                        await self._upsert_document(
+                            conn,
                             params["id"],
                             content,
-                            params.get("checksum", ""),
+                            str(params.get("checksum", "")),
                             metadata,
-                        )
-
-                        await conn.execute(
-                            f"""
-                            INSERT INTO "{self._embedded_table}" (doc_id, content, checksum, metadata, embedding)
-                            VALUES ($1, $2, $3, $4::jsonb, $5)
-                            ON CONFLICT (doc_id) DO UPDATE
-                            SET content = EXCLUDED.content,
-                                checksum = EXCLUDED.checksum,
-                                metadata = EXCLUDED.metadata,
-                                embedding = EXCLUDED.embedding
-                            """,
-                            params["id"],
-                            content,
-                            params.get("checksum", ""),
-                            metadata,
-                            HalfVector(embedding),
+                            embedding,
                         )
 
                 return UpdateResult(

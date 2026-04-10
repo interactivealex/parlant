@@ -829,3 +829,198 @@ async def test_that_shared_pool_is_not_closed_when_individual_database_exits(
     # Pool should still be usable after database exits
     row = await shared_pool.fetchval("SELECT 1")
     assert row == 1
+
+
+async def test_that_ne_filter_works(
+    postgres_db: Any,
+) -> None:
+    collection = await postgres_db.create_collection(
+        name="ne_filter_test", schema=PostgresTestDocument
+    )
+    await collection.insert_one(
+        PostgresTestDocument(
+            id=ObjectId("doc1"),
+            creation_utc=datetime.now(timezone.utc).isoformat(),
+            version=Version.String("1.0.0"),
+            name="alpha",
+        )
+    )
+    await collection.insert_one(
+        PostgresTestDocument(
+            id=ObjectId("doc2"),
+            creation_utc=datetime.now(timezone.utc).isoformat(),
+            version=Version.String("1.0.0"),
+            name="beta",
+        )
+    )
+
+    result = await collection.find({"name": {"$ne": "alpha"}})
+    assert result.total_count == 1
+    assert result.items[0]["name"] == "beta"
+
+
+async def test_that_or_logical_filter_works(
+    postgres_db: Any,
+) -> None:
+    collection = await postgres_db.create_collection(
+        name="or_filter_test", schema=PostgresTestDocument
+    )
+    for name in ["alpha", "beta", "gamma"]:
+        await collection.insert_one(
+            PostgresTestDocument(
+                id=ObjectId(f"doc_{name}"),
+                creation_utc=datetime.now(timezone.utc).isoformat(),
+                version=Version.String("1.0.0"),
+                name=name,
+            )
+        )
+
+    result = await collection.find(
+        {
+            "$or": [
+                {"name": {"$eq": "alpha"}},
+                {"name": {"$eq": "gamma"}},
+            ]
+        }
+    )
+    assert result.total_count == 2
+    names = {d["name"] for d in result.items}
+    assert names == {"alpha", "gamma"}
+
+
+async def test_that_indexed_field_comparison_filters_work(
+    postgres_db: Any,
+) -> None:
+    collection = await postgres_db.create_collection(
+        name="indexed_cmp_test", schema=PostgresTestDocument
+    )
+    for i, name in enumerate(["alpha", "beta", "gamma"]):
+        await collection.insert_one(
+            PostgresTestDocument(
+                id=ObjectId(f"doc_{i}"),
+                creation_utc=f"2024-01-0{i + 1}T00:00:00Z",
+                version=Version.String(f"{i + 1}.0.0"),
+                name=name,
+            )
+        )
+
+    # $gt on id (indexed field)
+    result = await collection.find({"id": {"$gt": "doc_0"}})
+    assert result.total_count == 2
+
+    # $in on version (indexed field)
+    result = await collection.find({"version": {"$in": ["1.0.0", "3.0.0"]}})
+    assert result.total_count == 2
+
+    # $lt on creation_utc (indexed field)
+    result = await collection.find({"creation_utc": {"$lt": "2024-01-02T00:00:00Z"}})
+    assert result.total_count == 1
+
+
+async def test_that_document_migration_upgrades_v1_to_v2(
+    postgres_db: Any,
+) -> None:
+    # Pre-create collection and insert a v1 document directly
+    pool = postgres_db._get_pool()
+    await pool.execute("""
+        CREATE TABLE IF NOT EXISTS "dummy_collection" (
+            "id" TEXT PRIMARY KEY,
+            "version" TEXT,
+            "creation_utc" TEXT,
+            data JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+    """)
+    await pool.execute(
+        """INSERT INTO "dummy_collection" ("id", "version", "creation_utc", data)
+           VALUES ($1, $2, $3, $4::jsonb)""",
+        "old_doc",
+        "1.0.0",
+        "2023-01-01T00:00:00Z",
+        {"name": "Old Document"},
+    )
+
+    async with DummyStore(postgres_db) as store:
+        retrieved = await store.read_dummy("old_doc")
+        assert retrieved is not None
+        assert retrieved["version"] == "2.0.0"
+        assert retrieved["additional_field"] == "default_value"
+        assert retrieved["name"] == "Old Document"
+
+
+async def test_that_failed_migrations_are_stored_in_separate_table(
+    postgres_db: Any,
+) -> None:
+    # Pre-create collection with a document that will fail migration (version 3.0.0)
+    pool = postgres_db._get_pool()
+    await pool.execute("""
+        CREATE TABLE IF NOT EXISTS "dummy_collection" (
+            "id" TEXT PRIMARY KEY,
+            "version" TEXT,
+            "creation_utc" TEXT,
+            data JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+    """)
+    await pool.execute(
+        """INSERT INTO "dummy_collection" ("id", "version", "creation_utc", data)
+           VALUES ($1, $2, $3, $4::jsonb)""",
+        "bad_doc",
+        "3.0.0",
+        "2023-01-01T00:00:00Z",
+        {"name": "Unmigratable"},
+    )
+
+    async with DummyStore(postgres_db) as store:
+        result = await store.list_dummy()
+        assert result.total_count == 0
+
+    # Check failed migrations table exists and contains the bad doc
+    failed_table = postgres_db._table_name("dummy_collection_failed_migrations")
+    exists = await postgres_db._table_exists(failed_table)
+    assert exists, "Failed migrations table should exist"
+
+    failed_rows = await pool.fetch(f'SELECT "id" FROM "{failed_table}"')
+    assert len(failed_rows) == 1
+    assert failed_rows[0]["id"] == "bad_doc"
+
+
+async def test_that_get_collection_raises_for_nonexistent(
+    postgres_db: Any,
+) -> None:
+    from parlant.core.persistence.document_database import identity_loader_for
+
+    with pytest.raises(ValueError, match="does not exist"):
+        await postgres_db.get_collection(
+            "nonexistent_collection",
+            PostgresTestDocument,
+            identity_loader_for(PostgresTestDocument),
+        )
+
+
+async def test_that_delete_collection_raises_for_nonexistent(
+    postgres_db: Any,
+) -> None:
+    with pytest.raises(ValueError, match="does not exist"):
+        await postgres_db.delete_collection("nonexistent_collection")
+
+
+async def test_that_long_collection_names_are_truncated_safely(
+    postgres_db: Any,
+) -> None:
+    long_name = "a" * 100
+    collection = await postgres_db.create_collection(name=long_name, schema=PostgresTestDocument)
+    assert collection is not None
+
+    # Verify table name respects 63-char limit
+    table = postgres_db._table_name(long_name)
+    assert len(table) <= 63
+
+    await collection.insert_one(
+        PostgresTestDocument(
+            id=ObjectId("doc1"),
+            creation_utc=datetime.now(timezone.utc).isoformat(),
+            version=Version.String("1.0.0"),
+            name="test",
+        )
+    )
+    result = await collection.find({})
+    assert result.total_count == 1

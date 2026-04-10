@@ -65,7 +65,11 @@ class _WhereTranslator:
         self._params.append(value)
         return f"${self._param_idx}"
 
+    _VALID_FIELD_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
     def _field_ref(self, field_name: str) -> str:
+        if not self._VALID_FIELD_RE.match(field_name):
+            raise ValueError(f"Invalid field name: {field_name!r}")
         if field_name in self.INDEXED_FIELDS:
             return f'"{field_name}"'
         return f"data->'{field_name}'"
@@ -211,6 +215,7 @@ class PostgresDocumentDatabase(DocumentDatabase):
         pool: Optional[asyncpg.Pool[asyncpg.Record]] = None,
         statement_timeout_ms: int = 30_000,
         lock_timeout_ms: int = 10_000,
+        command_timeout: float = 30.0,
     ) -> None:
         self._dsn = dsn
         self._logger = logger
@@ -218,6 +223,7 @@ class PostgresDocumentDatabase(DocumentDatabase):
         self._external_pool = pool
         self._pool: Optional[asyncpg.Pool[asyncpg.Record]] = None
         self._collections: dict[str, PostgresDocumentCollection[Any]] = {}
+        self._command_timeout = command_timeout
         self._server_settings = {
             "statement_timeout": str(statement_timeout_ms),
             "lock_timeout": str(lock_timeout_ms),
@@ -243,6 +249,7 @@ class PostgresDocumentDatabase(DocumentDatabase):
                 max_size=10,
                 init=self._init_connection,
                 server_settings=self._server_settings,
+                command_timeout=self._command_timeout,
             )
         return self
 
@@ -417,51 +424,52 @@ class PostgresDocumentDatabase(DocumentDatabase):
 
         failed_collection: Optional[DocumentCollection[TDocument]] = None
 
-        # Fetch documents in batches to avoid loading entire collection into memory.
-        all_docs: list[BaseDocument] = []
-        offset = 0
+        # Process documents in batches using keyset pagination to keep memory bounded.
+        last_id = ""
         while True:
             batch = await pool.fetch(
                 f'SELECT "id", "version", "creation_utc", data FROM "{table}" '
-                f'ORDER BY "id" LIMIT {self._MIGRATION_BATCH_SIZE} OFFSET {offset}',
+                f'WHERE "id" > $1 ORDER BY "id" LIMIT {self._MIGRATION_BATCH_SIZE}',
+                last_id,
             )
             if not batch:
                 break
-            all_docs.extend(self._row_to_document(row) for row in batch)
-            offset += len(batch)
+            last_id = batch[-1]["id"]
 
-        for doc in all_docs:
-            try:
-                if loaded_doc := await document_loader(doc):
-                    await self._replace_document(pool, table, doc["id"], loaded_doc)
-                    continue
+            for row in batch:
+                doc = self._row_to_document(row)
+                try:
+                    if loaded_doc := await document_loader(doc):
+                        await self._replace_document(pool, table, doc["id"], loaded_doc)
+                        continue
 
-                if failed_collection is None:
-                    self._logger.warning(
-                        f"Creating `{failed_table}` table to store failed migrations..."
+                    if failed_collection is None:
+                        self._logger.warning(
+                            f"Creating `{failed_table}` table to store failed migrations..."
+                        )
+                        failed_collection = await self._ensure_failed_migrations_table(
+                            pool, failed_table
+                        )
+
+                    self._logger.warning(f'Failed to load document "{doc}"')
+                    await failed_collection.insert_one(cast(TDocument, doc))
+                    await pool.execute(f'DELETE FROM "{table}" WHERE "id" = $1', doc["id"])
+
+                except Exception as e:
+                    if failed_collection is None:
+                        self._logger.warning(
+                            f"Creating `{failed_table}` table to store failed migrations..."
+                        )
+                        failed_collection = await self._ensure_failed_migrations_table(
+                            pool, failed_table
+                        )
+
+                    self._logger.error(
+                        f"Failed to load document '{doc}' with error: {e}. "
+                        f"Added to `{failed_table}` table."
                     )
-                    failed_collection = await self._ensure_failed_migrations_table(
-                        pool, failed_table
-                    )
-
-                self._logger.warning(f'Failed to load document "{doc}"')
-                await failed_collection.insert_one(cast(TDocument, doc))
-                await pool.execute(f'DELETE FROM "{table}" WHERE "id" = $1', doc["id"])
-
-            except Exception as e:
-                if failed_collection is None:
-                    self._logger.warning(
-                        f"Creating `{failed_table}` table to store failed migrations..."
-                    )
-                    failed_collection = await self._ensure_failed_migrations_table(
-                        pool, failed_table
-                    )
-
-                self._logger.error(
-                    f"Failed to load document '{doc}' with error: {e}. "
-                    f"Added to `{failed_table}` table."
-                )
-                await failed_collection.insert_one(cast(TDocument, doc))
+                    await failed_collection.insert_one(cast(TDocument, doc))
+                    await pool.execute(f'DELETE FROM "{table}" WHERE "id" = $1', doc["id"])
 
     @override
     async def get_or_create_collection(
@@ -568,8 +576,8 @@ class PostgresDocumentCollection(DocumentCollection[TDocument]):
         translator = _WhereTranslator()
         where_clause, params = translator.translate(filters)
 
-        # Cursor-based pagination
         if cursor is not None:
+            # Continue parameter numbering from the WHERE translation
             cursor_translator = _WhereTranslator()
             cursor_translator._param_idx = translator._param_idx
             cursor_translator._params = list(params)
@@ -652,6 +660,8 @@ class PostgresDocumentCollection(DocumentCollection[TDocument]):
         if sort:
             order_parts = []
             for field_name, direction in sort:
+                if not _WhereTranslator._VALID_FIELD_RE.match(field_name):
+                    raise ValueError(f"Invalid field name: {field_name!r}")
                 order = "DESC" if direction == SortDirection.DESC else "ASC"
                 if field_name in _WhereTranslator.INDEXED_FIELDS:
                     order_parts.append(f'"{field_name}" {order}')
@@ -675,6 +685,8 @@ class PostgresDocumentCollection(DocumentCollection[TDocument]):
         for idx, index in enumerate(indexes):
             cols = []
             for field_name, direction in index.fields:
+                if not _WhereTranslator._VALID_FIELD_RE.match(field_name):
+                    raise ValueError(f"Invalid field name: {field_name!r}")
                 order = "DESC" if direction == SortDirection.DESC else "ASC"
                 if field_name in _WhereTranslator.INDEXED_FIELDS:
                     cols.append(f'"{field_name}" {order}')

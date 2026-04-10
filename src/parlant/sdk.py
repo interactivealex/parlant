@@ -5206,15 +5206,29 @@ class Server:
                         "Please install parlant[postgres] to use PostgreSQL."
                     )
 
-                import asyncpg  # type: ignore[import-untyped]
+                import asyncpg  # type: ignore[import-untyped, import-not-found]
 
-                from parlant.adapters.db.postgres_db import PostgresDocumentDatabase
+                from parlant.adapters.vector_db.pgvector import PostgresVectorDatabase
+
+                # Create pgvector extension BEFORE pool creation, because
+                # _combined_pg_init calls register_vector() which requires
+                # the extension's types to already exist in pg_catalog.
+                bootstrap_conn = await asyncpg.connect(dsn=dsn, command_timeout=60.0)
+                try:
+                    await bootstrap_conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                finally:
+                    await bootstrap_conn.close()
+
+                async def _combined_pg_init(conn: Any) -> None:
+                    """Register both JSON codec and pgvector types on every new connection."""
+                    await PostgresVectorDatabase._init_connection(conn)
 
                 pool = await asyncpg.create_pool(
                     dsn=dsn,
                     min_size=2,
                     max_size=20,
-                    init=PostgresDocumentDatabase._init_connection,
+                    init=_combined_pg_init,
+                    command_timeout=30.0,
                 )
                 self._exit_stack.push_async_callback(pool.close)
                 _shared_pg_pools[dsn] = pool

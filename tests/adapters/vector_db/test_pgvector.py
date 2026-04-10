@@ -1014,3 +1014,144 @@ async def test_that_hnsw_index_is_created_for_high_dimension_embedder(
         collection._embedded_table,
     )
     assert row is not None, "HNSW index should be created for 3072 dimensions with halfvec"
+
+
+async def test_that_pgvector_ne_filter_works(
+    pgvector_db: object,
+) -> None:
+    db = pgvector_db
+    assert isinstance(db, PostgresVectorDatabase)
+
+    collection = await db.create_collection(
+        name="ne_filter_test",
+        schema=_TestDocument,
+        embedder_type=NullEmbedder,
+    )
+    await collection.insert_one(_make_doc("doc1", "alpha content", "alpha"))
+    await collection.insert_one(_make_doc("doc2", "beta content", "beta"))
+
+    results = await collection.find({"name": {"$ne": "alpha"}})
+    assert len(results) == 1
+    assert results[0]["name"] == "beta"
+
+
+async def test_that_pgvector_or_logical_filter_works(
+    pgvector_db: object,
+) -> None:
+    db = pgvector_db
+    assert isinstance(db, PostgresVectorDatabase)
+
+    collection = await db.create_collection(
+        name="or_filter_test",
+        schema=_TestDocument,
+        embedder_type=NullEmbedder,
+    )
+    await collection.insert_one(_make_doc("doc1", "alpha content", "alpha"))
+    await collection.insert_one(_make_doc("doc2", "beta content", "beta"))
+    await collection.insert_one(_make_doc("doc3", "gamma content", "gamma"))
+
+    results = await collection.find(
+        {
+            "$or": [
+                {"name": {"$eq": "alpha"}},
+                {"name": {"$eq": "gamma"}},
+            ]
+        }
+    )
+    assert len(results) == 2
+    names = {r["name"] for r in results}
+    assert names == {"alpha", "gamma"}
+
+
+async def test_that_similarity_search_with_filters_works(
+    pgvector_db: object,
+) -> None:
+    db = pgvector_db
+    assert isinstance(db, PostgresVectorDatabase)
+
+    collection = await db.create_collection(
+        name="sim_filter_test",
+        schema=_TestDocument,
+        embedder_type=NullEmbedder,
+    )
+    await collection.insert_one(_make_doc("doc1", "hello world", "alpha", rank=1))
+    await collection.insert_one(_make_doc("doc2", "goodbye world", "beta", rank=2))
+    await collection.insert_one(_make_doc("doc3", "hello again", "alpha", rank=3))
+
+    # Search with a filter that excludes doc2
+    results = await collection.find_similar_documents(
+        filters={"name": {"$eq": "alpha"}},
+        query="hello",
+        k=5,
+    )
+
+    # Only alpha docs should be returned
+    assert all(r.document["name"] == "alpha" for r in results)
+    assert len(results) == 2
+
+
+async def test_that_pgvector_get_collection_raises_for_nonexistent(
+    pgvector_db: object,
+) -> None:
+    db = pgvector_db
+    assert isinstance(db, PostgresVectorDatabase)
+
+    async def loader(doc: BaseDocument) -> Optional[_TestDocument]:
+        return cast(_TestDocument, doc)
+
+    with pytest.raises(ValueError, match="not found"):
+        await db.get_collection(
+            "nonexistent_collection",
+            _TestDocument,
+            NullEmbedder,
+            loader,
+        )
+
+
+async def test_that_pgvector_failed_migrations_are_stored_in_separate_table(
+    pgvector_db: object,
+) -> None:
+    db = pgvector_db
+    assert isinstance(db, PostgresVectorDatabase)
+
+    # Create a collection and insert documents
+    collection = await db.create_collection(
+        name="fail_migrate_test",
+        schema=_TestDocument,
+        embedder_type=NullEmbedder,
+    )
+    await collection.insert_one(_make_doc("good_doc", "good content", "good"))
+    await collection.insert_one(_make_doc("bad_doc", "bad content", "bad"))
+
+    pool = db._get_pool()
+
+    # Tamper with the unembedded table to set an unrecognized version
+    await pool.execute(
+        f"""UPDATE "{collection._unembedded_table}"
+            SET metadata = metadata || '{{"version": "99.0.0"}}'::jsonb
+            WHERE doc_id = $1""",
+        "bad_doc",
+    )
+
+    # Clear the in-memory cache so get_collection re-runs migration
+    db._collections.pop("fail_migrate_test", None)
+
+    async def rejecting_loader(doc: BaseDocument) -> Optional[_TestDocument]:
+        raw_meta = doc.get("version", "")
+        if raw_meta == "99.0.0":
+            return None  # Signal failure
+        return cast(_TestDocument, doc)
+
+    await db.get_collection(
+        "fail_migrate_test",
+        _TestDocument,
+        NullEmbedder,
+        rejecting_loader,
+    )
+
+    # Verify failed migrations table exists and contains the bad doc
+    failed_table = db._table_name("fail_migrate_test", "failed_migrations")
+    assert await db._table_exists(failed_table)
+
+    row = await pool.fetchrow(f'SELECT doc_id FROM "{failed_table}" WHERE doc_id = $1', "bad_doc")
+    assert row is not None, "bad_doc should be in the failed migrations table"
