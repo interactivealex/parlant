@@ -775,8 +775,8 @@ class PostgresDocumentCollection(DocumentCollection[TDocument]):
 
                 if row is not None:
                     existing = PostgresDocumentDatabase._row_to_document(row)
+                    existing_id = existing["id"]
                     merged = {**existing, **params}
-                    doc_id = merged["id"]
                     data = {
                         k: v
                         for k, v in merged.items()
@@ -786,14 +786,15 @@ class PostgresDocumentCollection(DocumentCollection[TDocument]):
                     updated_row = await conn.fetchrow(
                         f"""
                         UPDATE "{self._table}"
-                        SET "version" = $1, "creation_utc" = $2, data = $3::jsonb
-                        WHERE "id" = $4
+                        SET "id" = $1, "version" = $2, "creation_utc" = $3, data = $4::jsonb
+                        WHERE "id" = $5
                         RETURNING "id", "version", "creation_utc", data
                         """,
-                        merged.get("version"),
-                        merged.get("creation_utc"),
+                        merged["id"],
+                        merged["version"],
+                        merged["creation_utc"],
                         data,
-                        doc_id,
+                        existing_id,
                     )
 
                     assert updated_row is not None
