@@ -80,7 +80,7 @@ class ChildEvaluation(DefaultBaseModel):
     child_id: str
     child_action: str
     condition_to_child: str
-    condition_to_child_and_stop: str
+    condition_to_child_and_stop: Optional[str] = None
     conditions_to_child_and_forward: Optional[list[PathCondition]] = None
 
 
@@ -705,19 +705,20 @@ OUTPUT FORMAT
                     for c in inference.content.children_conditions:
                         # Condition of the path that ends with child
                         if not new_graph[c.child_id].kind == JourneyNodeKind.FORK:
-                            if (
-                                not children_info[c.child_id].action
-                                and not new_graph[c.child_id].kind == JourneyNodeKind.FORK
-                            ):
-                                path = ["None"]
-                            else:
-                                path = [c.child_id]
-                            reachable_follow_ups.append(
-                                _ReachableFollowUps(
-                                    condition=c.condition_to_child_and_stop,
-                                    path=path,
+                            if c.condition_to_child_and_stop is not None:
+                                if (
+                                    not children_info[c.child_id].action
+                                    and not new_graph[c.child_id].kind == JourneyNodeKind.FORK
+                                ):
+                                    path = ["None"]
+                                else:
+                                    path = [c.child_id]
+                                reachable_follow_ups.append(
+                                    _ReachableFollowUps(
+                                        condition=c.condition_to_child_and_stop,
+                                        path=path,
+                                    )
                                 )
-                            )
 
                         # Conditions of the paths to child and forward
                         if c.conditions_to_child_and_forward:
