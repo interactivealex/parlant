@@ -168,6 +168,7 @@ from parlant.core.nlp.generation import (
 from parlant.core.nlp.tokenization import EstimatingTokenizer
 from parlant.core.persistence.common import ObjectId
 from parlant.core.persistence.document_database import DocumentDatabase, identity_loader_for
+from parlant.core.persistence.vector_database import VectorDatabase
 from parlant.core.relationships import (
     RelationshipKind,
     RelationshipDocumentStore,
@@ -5335,6 +5336,96 @@ class Server:
 
                 return db
 
+            _shared_pg_pools: dict[str, Any] = {}
+            _shared_pg_vector_pools: dict[str, Any] = {}
+
+            _pg_server_settings = {
+                "statement_timeout": "30000",
+                "lock_timeout": "10000",
+            }
+
+            async def _get_shared_pg_pool(dsn: str) -> Any:
+                """Get or create a shared asyncpg pool for document stores (no pgvector)."""
+                nonlocal _shared_pg_pools
+
+                if dsn in _shared_pg_pools:
+                    return _shared_pg_pools[dsn]
+
+                if importlib.util.find_spec("asyncpg") is None:
+                    raise SDKError(
+                        "PostgreSQL requires additional packages to be installed. "
+                        "Please install parlant[postgres] to use PostgreSQL."
+                    )
+
+                import asyncpg  # type: ignore[import-untyped, import-not-found]
+
+                from parlant.adapters.db.postgres_db import PostgresDocumentDatabase
+
+                pool = await asyncpg.create_pool(
+                    dsn=dsn,
+                    min_size=2,
+                    max_size=20,
+                    init=PostgresDocumentDatabase._init_connection,
+                    server_settings=_pg_server_settings,
+                    command_timeout=30.0,
+                )
+                self._exit_stack.push_async_callback(pool.close)
+                _shared_pg_pools[dsn] = pool
+                return pool
+
+            async def _get_shared_pg_vector_pool(dsn: str) -> Any:
+                """Get or create a shared asyncpg pool with pgvector support.
+
+                Creates a separate pool from the plain document pool because
+                vector-aware connections require the pgvector extension and
+                register_vector() on each connection.
+                """
+                nonlocal _shared_pg_vector_pools
+
+                if dsn in _shared_pg_vector_pools:
+                    return _shared_pg_vector_pools[dsn]
+
+                import asyncpg  # type: ignore[import-untyped, import-not-found]
+
+                from parlant.adapters.vector_db.pgvector import PostgresVectorDatabase
+
+                # Create pgvector extension BEFORE pool creation, because
+                # _combined_pg_init calls register_vector() which requires
+                # the extension's types to already exist in pg_catalog.
+                bootstrap_conn = await asyncpg.connect(dsn=dsn, command_timeout=60.0)
+                try:
+                    await bootstrap_conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                finally:
+                    await bootstrap_conn.close()
+
+                pool = await asyncpg.create_pool(
+                    dsn=dsn,
+                    min_size=2,
+                    max_size=20,
+                    init=PostgresVectorDatabase._init_connection,
+                    server_settings=_pg_server_settings,
+                    command_timeout=30.0,
+                )
+                self._exit_stack.push_async_callback(pool.close)
+                _shared_pg_vector_pools[dsn] = pool
+                return pool
+
+            async def make_postgres_db(dsn: str, name: str) -> DocumentDatabase:
+                from parlant.adapters.db.postgres_db import PostgresDocumentDatabase
+
+                pool = await _get_shared_pg_pool(dsn)
+
+                db = await self._exit_stack.enter_async_context(
+                    PostgresDocumentDatabase(
+                        dsn=dsn,
+                        logger=c()[Logger],
+                        table_prefix=name,
+                        pool=pool,
+                    )
+                )
+
+                return db
+
             async def make_persistable_store(t: type[T], spec: str, name: str, **kwargs: Any) -> T:
                 store: T
 
@@ -5366,11 +5457,27 @@ class Server:
                     )
 
                     return store
+                elif spec.startswith("postgresql://") or spec.startswith("postgres://"):
+                    store = await self._exit_stack.enter_async_context(
+                        t(
+                            database=await make_postgres_db(spec, name),
+                            allow_migration=self._migrate,
+                            **kwargs,
+                        )  # type: ignore
+                    )
+
+                    return store
                 else:
                     raise SDKError(
                         f"Invalid session store type: {self._session_store}. "
-                        "Expected 'transient', 'local', or a MongoDB connection string."
+                        "Expected 'transient', 'local', a MongoDB connection string, "
+                        "or a PostgreSQL connection string."
                     )
+
+            _pg_spec = self._session_store
+            _is_pg = isinstance(_pg_spec, str) and (
+                _pg_spec.startswith("postgresql://") or _pg_spec.startswith("postgres://")
+            )
 
             if isinstance(self._session_store, SessionStore):
                 c()[SessionStore] = self._session_store
@@ -5420,22 +5527,49 @@ class Server:
             async def get_embedder_type() -> type[Embedder]:
                 return type(await c()[NLPService].get_embedder())
 
-            for vector_store_interface, vector_store_type in [
-                (GlossaryStore, GlossaryVectorStore),
-                (CannedResponseStore, CannedResponseVectorStore),
-                (CapabilityStore, CapabilityVectorStore),
-                (JourneyStore, JourneyVectorStore),
+            _shared_pg_vector_db: VectorDatabase | None = None
+            if _is_pg:
+                from parlant.adapters.vector_db.pgvector import PostgresVectorDatabase
+
+                _pg_dsn = cast(str, _pg_spec)
+                _pg_vector_pool = await _get_shared_pg_vector_pool(_pg_dsn)
+
+                _shared_pg_vector_db = await self._exit_stack.enter_async_context(
+                    PostgresVectorDatabase(
+                        dsn=_pg_dsn,
+                        logger=c()[Logger],
+                        tracer=c()[Tracer],
+                        embedder_factory=embedder_factory,
+                        embedding_cache_provider=lambda: c()[EmbeddingCache],
+                        pool=_pg_vector_pool,
+                    )
+                )
+
+            for vector_store_interface, vector_store_type, _doc_prefix in [
+                (GlossaryStore, GlossaryVectorStore, "glossary"),
+                (CannedResponseStore, CannedResponseVectorStore, "canned_responses"),
+                (CapabilityStore, CapabilityVectorStore, "capabilities"),
+                (JourneyStore, JourneyVectorStore, "journeys"),
             ]:
+                _vector_db: VectorDatabase
+                if _is_pg:
+                    assert _shared_pg_vector_db is not None
+                    _vector_db = _shared_pg_vector_db
+                    _document_db = await make_postgres_db(cast(str, _pg_spec), _doc_prefix)
+                else:
+                    _vector_db = TransientVectorDatabase(
+                        c()[Logger],
+                        c()[Tracer],
+                        embedder_factory,
+                        lambda: c()[EmbeddingCache],
+                    )
+                    _document_db = TransientDocumentDatabase()
+
                 c()[vector_store_interface] = await self._exit_stack.enter_async_context(
                     vector_store_type(
                         id_generator=c()[IdGenerator],
-                        vector_db=TransientVectorDatabase(
-                            c()[Logger],
-                            c()[Tracer],
-                            embedder_factory,
-                            lambda: c()[EmbeddingCache],
-                        ),
-                        document_db=TransientDocumentDatabase(),
+                        vector_db=_vector_db,
+                        document_db=_document_db,
                         embedder_factory=embedder_factory,
                         embedder_type_provider=get_embedder_type,
                     )  # type: ignore
