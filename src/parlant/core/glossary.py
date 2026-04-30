@@ -218,23 +218,25 @@ class GlossaryVectorStore(GlossaryStore):
             store=self,
             database=self._vector_db,
             allow_migration=self._allow_migration,
-        ):
+        ) as vector_migration_helper:
             self._collection = await self._vector_db.get_or_create_collection(
                 name="glossary",
                 schema=_TermDocument,
                 embedder_type=embedder_type,
                 document_loader=self._document_loader,
+                migration_required=vector_migration_helper.migration_required,
             )
 
         async with DocumentStoreMigrationHelper(
             store=self,
             database=self._document_db,
             allow_migration=self._allow_migration,
-        ):
+        ) as document_migration_helper:
             self._association_collection = await self._document_db.get_or_create_collection(
                 name="glossary_tags",
                 schema=TermTagAssociationDocument,
                 document_loader=self._association_document_loader,
+                migration_required=document_migration_helper.migration_required,
             )
 
         return self

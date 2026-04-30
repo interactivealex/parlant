@@ -50,14 +50,15 @@ class DocumentStoreMigrationHelper:
         self._runtime_store_version = store.VERSION.to_string()
         self._database = database
         self._allow_migration = allow_migration
+        self.migration_required: bool = False
 
     async def __aenter__(self) -> Self:
-        migration_required = await self._is_migration_required(
+        self.migration_required = await self._is_migration_required(
             self._database,
             self._runtime_store_version,
         )
 
-        if migration_required and not self._allow_migration:
+        if self.migration_required and not self._allow_migration:
             raise MigrationRequired(f"Migration required for {self._store_name}.")
 
         return self

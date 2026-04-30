@@ -194,11 +194,12 @@ class ServiceDocumentRegistry(ServiceRegistry):
             store=self,
             database=self._database,
             allow_migration=self._allow_migration,
-        ):
+        ) as migration_helper:
             self._tool_services_collection = await self._database.get_or_create_collection(
                 name="tool_services",
                 schema=_ToolServiceDocument,
                 document_loader=self._document_loader,
+                migration_required=migration_helper.migration_required,
             )
 
         self._moderation_services = {

@@ -136,9 +136,15 @@ class DocumentDatabase(ABC):
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> DocumentCollection[TDocument]:
         """
         Retrieves an existing collection by its name.
+
+        When ``migration_required`` is False, adapters that perform a per-row
+        migration walk on open may skip it. Stores forward this from
+        ``DocumentStoreMigrationHelper.migration_required`` so warm starts at
+        unchanged ``store.VERSION`` avoid the row scan.
         """
         ...
 
@@ -148,9 +154,12 @@ class DocumentDatabase(ABC):
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> DocumentCollection[TDocument]:
         """
         Retrieves an existing collection by its name or creates a new one if it does not exist.
+
+        See ``get_collection`` for the meaning of ``migration_required``.
         """
         ...
 

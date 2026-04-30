@@ -215,7 +215,9 @@ class MongoVectorDatabase(VectorDatabase):
         schema: type[TDocument],
         embedder_type: type[Embedder],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> MongoVectorCollection[TDocument]:
+        del migration_required
         if collection := self._collections.get(name):
             return cast(MongoVectorCollection[TDocument], collection)
 
@@ -253,7 +255,9 @@ class MongoVectorDatabase(VectorDatabase):
         schema: type[TDocument],
         embedder_type: type[Embedder],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> MongoVectorCollection[TDocument]:
+        del migration_required
         if collection := self._collections.get(name):
             return cast(MongoVectorCollection[TDocument], collection)
 

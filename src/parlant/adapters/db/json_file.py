@@ -162,7 +162,9 @@ class JSONFileDocumentDatabase(DocumentDatabase):
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> JSONFileDocumentCollection[TDocument]:
+        del migration_required
         if collection := self._collections.get(name):
             return cast(JSONFileDocumentCollection[TDocument], collection)
 
@@ -183,7 +185,9 @@ class JSONFileDocumentDatabase(DocumentDatabase):
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> JSONFileDocumentCollection[TDocument]:
+        del migration_required
         if collection := self._collections.get(name):
             return cast(JSONFileDocumentCollection[TDocument], collection)
 

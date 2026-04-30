@@ -347,11 +347,12 @@ class ContextVariableDocumentStore(ContextVariableStore):
             store=self,
             database=self._database,
             allow_migration=self._allow_migration,
-        ):
+        ) as migration_helper:
             self._variable_collection = await self._database.get_or_create_collection(
                 name="variables",
                 schema=_ContextVariableDocument,
                 document_loader=self._variable_document_loader,
+                migration_required=migration_helper.migration_required,
             )
 
             self._variable_tag_association_collection = (
@@ -359,6 +360,7 @@ class ContextVariableDocumentStore(ContextVariableStore):
                     name="variable_tag_associations",
                     schema=ContextVariableTagAssociationDocument,
                     document_loader=self._variable_tag_association_document_loader,
+                    migration_required=migration_helper.migration_required,
                 )
             )
 
@@ -366,6 +368,7 @@ class ContextVariableDocumentStore(ContextVariableStore):
                 name="values",
                 schema=_ContextVariableValueDocument,
                 document_loader=self._value_document_loader,
+                migration_required=migration_helper.migration_required,
             )
         return self
 

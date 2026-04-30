@@ -902,16 +902,18 @@ class SessionDocumentStore(SessionStore):
             store=self,
             database=self._database,
             allow_migration=self._allow_migration,
-        ):
+        ) as migration_helper:
             self._session_collection = await self._database.get_or_create_collection(
                 name="sessions",
                 schema=_SessionDocument,
                 document_loader=self._session_document_loader,
+                migration_required=migration_helper.migration_required,
             )
             self._event_collection = await self._database.get_or_create_collection(
                 name="events",
                 schema=_EventDocument,
                 document_loader=self._event_document_loader,
+                migration_required=migration_helper.migration_required,
             )
             await self._session_collection.ensure_indexes(
                 [

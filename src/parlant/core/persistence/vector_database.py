@@ -98,6 +98,7 @@ class VectorDatabase(ABC):
         schema: type[TDocument],
         embedder_type: type[Embedder],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> VectorCollection[TDocument]: ...
 
     @abstractmethod
@@ -107,6 +108,7 @@ class VectorDatabase(ABC):
         schema: type[TDocument],
         embedder_type: type[Embedder],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> VectorCollection[TDocument]: ...
 
     @abstractmethod

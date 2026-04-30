@@ -451,29 +451,32 @@ class CannedResponseVectorStore(CannedResponseStore):
             store=self,
             database=self._vector_db,
             allow_migration=self._allow_migration,
-        ):
+        ) as vector_migration_helper:
             self._canreps_vector_collection = await self._vector_db.get_or_create_collection(
                 name="canned_responses",
                 schema=CannedResponseVectorDocument,
                 embedder_type=embedder_type,
                 document_loader=self._vector_document_loader,
+                migration_required=vector_migration_helper.migration_required,
             )
 
         async with DocumentStoreMigrationHelper(
             store=self,
             database=self._database,
             allow_migration=self._allow_migration,
-        ):
+        ) as document_migration_helper:
             self._canreps_collection = await self._database.get_or_create_collection(
                 name="canned_responses",
                 schema=CannedResponseDocument,
                 document_loader=self._document_loader,
+                migration_required=document_migration_helper.migration_required,
             )
 
             self._canrep_tag_association_collection = await self._database.get_or_create_collection(
                 name="canned_response_tag_associations",
                 schema=CannedResponseTagAssociationDocument,
                 document_loader=self._association_document_loader,
+                migration_required=document_migration_helper.migration_required,
             )
 
         return self

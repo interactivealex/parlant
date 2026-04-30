@@ -621,7 +621,9 @@ class QdrantDatabase(VectorDatabase):
         schema: type[TDocument],
         embedder_type: type[Embedder],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> QdrantCollection[TDocument]:
+        del migration_required
         assert self.qdrant_client is not None, "Qdrant client must be initialized"
         assert self._embedder_factory is not None, "Embedder factory must be provided"
         assert self._embedding_cache_provider is not None, (
@@ -688,7 +690,9 @@ class QdrantDatabase(VectorDatabase):
         schema: type[TDocument],
         embedder_type: type[Embedder],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> QdrantCollection[TDocument]:
+        del migration_required
         assert self.qdrant_client is not None, "Qdrant client must be initialized"
         assert self._embedder_factory is not None, "Embedder factory must be provided"
         assert self._embedding_cache_provider is not None, (

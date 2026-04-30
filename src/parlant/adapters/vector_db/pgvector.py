@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from typing import Any, Awaitable, Callable, Generic, Mapping, Optional, Sequence, cast
 
 from typing_extensions import override, Self
@@ -353,8 +354,6 @@ class PostgresVectorDatabase(VectorDatabase):
                 metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb
             )
         """)
-        # Drop old default-opclass GIN index if it exists, then create with jsonb_path_ops
-        await pool.execute(f'DROP INDEX IF EXISTS "idx_{table_name}_metadata"')
         await pool.execute(
             f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_metadata_pathops" '
             f'ON "{table_name}" USING GIN (metadata jsonb_path_ops)'
@@ -371,9 +370,6 @@ class PostgresVectorDatabase(VectorDatabase):
                 embedding halfvec({dimensions})
             )
         """)
-
-        # Drop old default-opclass GIN index if it exists, then create with jsonb_path_ops
-        await pool.execute(f'DROP INDEX IF EXISTS "idx_{table_name}_metadata"')
         await pool.execute(
             f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_metadata_pathops" '
             f'ON "{table_name}" USING GIN (metadata jsonb_path_ops)'
@@ -538,27 +534,48 @@ class PostgresVectorDatabase(VectorDatabase):
         collection_name: str,
         unembedded_table: str,
         embedded_table: str,
-        embedder_type: type[Embedder],
+        embedder: Embedder,
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> None:
-        """Run document_loader on all documents, migrating as needed.
+        """Run document_loader on all documents (when needed) and sync the embedded table.
+
+        When ``migration_required`` is False the per-row walk is skipped; only the
+        unembedded → embedded sync runs. The sync issues two lightweight roundtrips
+        when the tables are already in sync (one orphan-delete probe + one diff
+        probe, both returning zero rows), so it stays cheap on warm starts while
+        still picking up out-of-band writes and embedder-type changes.
 
         Acquires an advisory lock so concurrent workers don't duplicate migration work.
         """
         pool = self._get_pool()
-        embedder = self._embedder_factory.create_embedder(embedder_type)
 
         lock_id = self._advisory_lock_id(unembedded_table)
         async with pool.acquire() as lock_conn:
             await lock_conn.execute("SELECT pg_advisory_lock($1)", lock_id)
             try:
-                await self._do_load_and_migrate(
-                    pool,
-                    collection_name,
-                    unembedded_table,
-                    embedded_table,
-                    embedder,
-                    document_loader,
+                if migration_required:
+                    start = time.perf_counter()
+                    walked, updated = await self._do_load_and_migrate(
+                        pool,
+                        collection_name,
+                        unembedded_table,
+                        document_loader,
+                    )
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    log = self._logger.info if walked else self._logger.debug
+                    log(
+                        f"[pgvector:{collection_name}] migration: "
+                        f"walked={walked} updated={updated} in {elapsed_ms:.0f} ms"
+                    )
+                else:
+                    self._logger.info(
+                        f"[pgvector:{collection_name}] skipping per-row migration "
+                        f"(store version unchanged)"
+                    )
+
+                await self._sync_embedded_with_unembedded(
+                    unembedded_table, embedded_table, embedder
                 )
             finally:
                 await lock_conn.execute("SELECT pg_advisory_unlock($1)", lock_id)
@@ -570,15 +587,15 @@ class PostgresVectorDatabase(VectorDatabase):
         pool: asyncpg.Pool[asyncpg.Record],
         collection_name: str,
         unembedded_table: str,
-        embedded_table: str,
-        embedder: Embedder,
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
-    ) -> None:
+    ) -> tuple[int, int]:
         """Inner migration logic (must be called under advisory lock).
 
         Processes rows in batches using keyset pagination to keep memory bounded.
         Failed documents are moved to a dedicated failed_migrations table
         instead of being silently deleted.
+
+        Returns ``(walked, updated)`` for diagnostics.
         """
         failed_table = self._table_name(collection_name, "failed_migrations")
 
@@ -589,6 +606,8 @@ class PostgresVectorDatabase(VectorDatabase):
 
         failed_table_created = False
 
+        walked = 0
+        updated = 0
         last_id = ""
         while True:
             batch = await pool.fetch(
@@ -599,6 +618,7 @@ class PostgresVectorDatabase(VectorDatabase):
             if not batch:
                 break
             last_id = batch[-1]["doc_id"]
+            walked += len(batch)
 
             for row in batch:
                 doc = self._row_to_document(row)
@@ -619,6 +639,7 @@ class PostgresVectorDatabase(VectorDatabase):
                                 metadata,
                                 loaded_doc["id"],
                             )
+                            updated += 1
                     else:
                         self._logger.warning(f'Failed to load document "{doc}"')
                         failed_table_created = await self._handle_failed_migration(
@@ -634,8 +655,7 @@ class PostgresVectorDatabase(VectorDatabase):
                         pool, failed_table, unembedded_table, doc, failed_table_created
                     )
 
-        # Now sync embedded table
-        await self._sync_embedded_with_unembedded(unembedded_table, embedded_table, embedder)
+        return walked, updated
 
     async def _handle_failed_migration(
         self,
@@ -716,6 +736,7 @@ class PostgresVectorDatabase(VectorDatabase):
         schema: type[TDocument],
         embedder_type: type[Embedder],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> PostgresVectorCollection[TDocument]:
         if collection := self._collections.get(name):
             return cast(PostgresVectorCollection[TDocument], collection)
@@ -731,9 +752,14 @@ class PostgresVectorDatabase(VectorDatabase):
         if not await self._table_exists(embedded_table):
             await self._create_embedded_table(embedded_table, embedder.dimensions)
 
-        # Load/migrate documents and sync
+        # Load/migrate documents (when required) and sync
         await self._load_and_migrate_documents(
-            name, unembedded_table, embedded_table, embedder_type, document_loader
+            name,
+            unembedded_table,
+            embedded_table,
+            embedder,
+            document_loader,
+            migration_required=migration_required,
         )
 
         collection_obj = PostgresVectorCollection[TDocument](
@@ -758,6 +784,7 @@ class PostgresVectorDatabase(VectorDatabase):
         schema: type[TDocument],
         embedder_type: type[Embedder],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> PostgresVectorCollection[TDocument]:
         if collection := self._collections.get(name):
             return cast(PostgresVectorCollection[TDocument], collection)
@@ -769,9 +796,14 @@ class PostgresVectorDatabase(VectorDatabase):
         await self._create_unembedded_table(unembedded_table)
         await self._create_embedded_table(embedded_table, embedder.dimensions)
 
-        # Load/migrate documents and sync
+        # Load/migrate documents (when required) and sync
         await self._load_and_migrate_documents(
-            name, unembedded_table, embedded_table, embedder_type, document_loader
+            name,
+            unembedded_table,
+            embedded_table,
+            embedder,
+            document_loader,
+            migration_required=migration_required,
         )
 
         collection_obj = PostgresVectorCollection[TDocument](

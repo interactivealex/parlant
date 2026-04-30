@@ -195,17 +195,19 @@ class CustomerDocumentStore(CustomerStore):
             store=self,
             database=self._database,
             allow_migration=self._allow_migration,
-        ):
+        ) as migration_helper:
             self._customers_collection = await self._database.get_or_create_collection(
                 name="customers",
                 schema=_CustomerDocument,
                 document_loader=self._document_loader,
+                migration_required=migration_helper.migration_required,
             )
 
             self._tag_association_collection = await self._database.get_or_create_collection(
                 name="customer_tag_associations",
                 schema=_CustomerTagAssociationDocument,
                 document_loader=self._association_document_loader,
+                migration_required=migration_helper.migration_required,
             )
             await self._customers_collection.ensure_indexes(
                 [CollectionIndex(fields=(("id", SortDirection.ASC),))]

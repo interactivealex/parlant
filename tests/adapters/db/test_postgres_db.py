@@ -104,6 +104,11 @@ class DummyStore:
             database=self._database,
             allow_migration=self.allow_migration,
         ):
+            # Omits ``migration_required`` so the default ``True`` keeps the row
+            # walk unconditional. Several tests in this file pre-seed v1/v3 docs
+            # via raw SQL without writing the metadata row, which would make
+            # ``helper.migration_required`` False on first open (bootstrap
+            # branch) and skip the walk those tests rely on.
             self._collection = await self._database.get_or_create_collection(
                 name="dummy_collection",
                 schema=DummyStore.DummyDocumentV2,
@@ -1024,3 +1029,125 @@ async def test_that_long_collection_names_are_truncated_safely(
     )
     result = await collection.find({})
     assert result.total_count == 1
+
+
+async def test_that_get_or_create_collection_skips_run_migration_when_migration_required_is_false(
+    postgres_db: Any,
+) -> None:
+    from unittest.mock import AsyncMock, patch
+    from parlant.core.persistence.document_database import identity_loader_for
+
+    pool = postgres_db._get_pool()
+    await pool.execute("""
+        CREATE TABLE IF NOT EXISTS "skip_run_migration" (
+            "id" TEXT PRIMARY KEY,
+            "version" TEXT,
+            "creation_utc" TEXT,
+            data JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+    """)
+    await pool.execute(
+        """INSERT INTO "skip_run_migration" ("id", "version", "creation_utc", data)
+           VALUES ($1, $2, $3, $4::jsonb)""",
+        "doc1",
+        "1.0.0",
+        "2023-01-01T00:00:00Z",
+        {"name": "Doc 1"},
+    )
+
+    with patch.object(postgres_db, "_run_migration", new_callable=AsyncMock) as spy:
+        await postgres_db.get_or_create_collection(
+            name="skip_run_migration",
+            schema=PostgresTestDocument,
+            document_loader=identity_loader_for(PostgresTestDocument),
+            migration_required=False,
+        )
+    spy.assert_not_awaited()
+
+
+async def test_that_get_or_create_collection_runs_run_migration_when_migration_required_is_true_or_omitted(
+    postgres_db: Any,
+) -> None:
+    from unittest.mock import AsyncMock, patch
+    from parlant.core.persistence.document_database import identity_loader_for
+
+    pool = postgres_db._get_pool()
+    await pool.execute("""
+        CREATE TABLE IF NOT EXISTS "run_migration_test" (
+            "id" TEXT PRIMARY KEY,
+            "version" TEXT,
+            "creation_utc" TEXT,
+            data JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+    """)
+    await pool.execute(
+        """INSERT INTO "run_migration_test" ("id", "version", "creation_utc", data)
+           VALUES ($1, $2, $3, $4::jsonb)""",
+        "doc1",
+        "1.0.0",
+        "2023-01-01T00:00:00Z",
+        {"name": "Doc 1"},
+    )
+
+    # Default — must call _run_migration
+    with patch.object(
+        postgres_db, "_run_migration", new_callable=AsyncMock, return_value=(0, 0)
+    ) as spy_default:
+        await postgres_db.get_or_create_collection(
+            name="run_migration_test",
+            schema=PostgresTestDocument,
+            document_loader=identity_loader_for(PostgresTestDocument),
+        )
+    spy_default.assert_awaited_once()
+
+    # Explicit True — also must call
+    with patch.object(
+        postgres_db, "_run_migration", new_callable=AsyncMock, return_value=(0, 0)
+    ) as spy_explicit:
+        await postgres_db.get_or_create_collection(
+            name="run_migration_test",
+            schema=PostgresTestDocument,
+            document_loader=identity_loader_for(PostgresTestDocument),
+            migration_required=True,
+        )
+    spy_explicit.assert_awaited_once()
+
+
+async def test_that_document_store_migration_helper_exposes_migration_required_after_aenter(
+    postgres_db: Any,
+) -> None:
+    class _StubVersionedStore:
+        VERSION = Version.from_string("1.0.0")
+
+    original_version = _StubVersionedStore.VERSION
+    try:
+        async with DocumentStoreMigrationHelper(
+            store=cast(Any, _StubVersionedStore()),
+            database=postgres_db,
+            allow_migration=True,
+        ) as helper:
+            assert helper.migration_required is False
+
+        async with DocumentStoreMigrationHelper(
+            store=cast(Any, _StubVersionedStore()),
+            database=postgres_db,
+            allow_migration=True,
+        ) as helper:
+            assert helper.migration_required is False
+
+        _StubVersionedStore.VERSION = Version.from_string("2.0.0")
+        async with DocumentStoreMigrationHelper(
+            store=cast(Any, _StubVersionedStore()),
+            database=postgres_db,
+            allow_migration=True,
+        ) as helper:
+            assert helper.migration_required is True
+
+        async with DocumentStoreMigrationHelper(
+            store=cast(Any, _StubVersionedStore()),
+            database=postgres_db,
+            allow_migration=True,
+        ) as helper:
+            assert helper.migration_required is False
+    finally:
+        _StubVersionedStore.VERSION = original_version

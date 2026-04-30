@@ -672,41 +672,46 @@ class JourneyVectorStore(JourneyStore):
             store=self,
             database=self._vector_db,
             allow_migration=self._allow_migration,
-        ):
+        ) as vector_migration_helper:
             self._vector_collection = await self._vector_db.get_or_create_collection(
                 name="journeys",
                 schema=JourneyVectorDocument,
                 embedder_type=embedder_type,
                 document_loader=self._vector_document_loader,
+                migration_required=vector_migration_helper.migration_required,
             )
 
         async with DocumentStoreMigrationHelper(
             store=self,
             database=self._document_db,
             allow_migration=self._allow_migration,
-        ):
+        ) as document_migration_helper:
             self._collection = await self._document_db.get_or_create_collection(
                 name="journeys",
                 schema=JourneyDocument,
                 document_loader=self._document_loader,
+                migration_required=document_migration_helper.migration_required,
             )
 
             self._node_association_collection = await self._document_db.get_or_create_collection(
                 name="journey_nodes",
                 schema=JourneyNodeAssociationDocument,
                 document_loader=self._node_association_loader,
+                migration_required=document_migration_helper.migration_required,
             )
 
             self._edge_association_collection = await self._document_db.get_or_create_collection(
                 name="journey_edges",
                 schema=JourneyEdgeAssociationDocument,
                 document_loader=self._edge_association_loader,
+                migration_required=document_migration_helper.migration_required,
             )
 
             self._tag_association_collection = await self._document_db.get_or_create_collection(
                 name="journey_tags",
                 schema=JourneyTagAssociationDocument,
                 document_loader=self._tag_association_loader,
+                migration_required=document_migration_helper.migration_required,
             )
 
             self._condition_association_collection = (
@@ -714,6 +719,7 @@ class JourneyVectorStore(JourneyStore):
                     name="journey_conditions",
                     schema=JourneyConditionAssociationDocument,
                     document_loader=self._condition_association_loader,
+                    migration_required=document_migration_helper.migration_required,
                 )
             )
 

@@ -80,7 +80,9 @@ class MongoDocumentDatabase(DocumentDatabase):
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[TDocument | None]],
+        migration_required: bool = True,
     ) -> DocumentCollection[TDocument]:
+        del migration_required
         if self._database is None:
             raise Exception("underlying database missing.")
 
@@ -145,8 +147,9 @@ class MongoDocumentDatabase(DocumentDatabase):
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[TDocument | None]],
+        migration_required: bool = True,
     ) -> DocumentCollection[TDocument]:
-        return await self.get_collection(name, schema, document_loader)
+        return await self.get_collection(name, schema, document_loader, migration_required)
 
     async def delete_collection(self, name: str) -> None:
         if self._database is None:

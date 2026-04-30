@@ -1155,3 +1155,213 @@ async def test_that_pgvector_failed_migrations_are_stored_in_separate_table(
 
     row = await pool.fetchrow(f'SELECT doc_id FROM "{failed_table}" WHERE doc_id = $1', "bad_doc")
     assert row is not None, "bad_doc should be in the failed migrations table"
+
+
+async def test_that_get_or_create_collection_skips_per_row_migration_when_migration_required_is_false(
+    pgvector_db: object,
+) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    db = pgvector_db
+    assert isinstance(db, PostgresVectorDatabase)
+
+    async def identity(doc: BaseDocument) -> Optional[_TestDocument]:
+        return cast(_TestDocument, doc)
+
+    collection = await db.get_or_create_collection(
+        name="skip_migration_test",
+        schema=_TestDocument,
+        embedder_type=NullEmbedder,
+        document_loader=identity,
+    )
+    await collection.insert_one(_make_doc("doc1", "existing content", "existing"))
+    db._collections.pop("skip_migration_test", None)
+
+    with patch.object(db, "_do_load_and_migrate", new_callable=AsyncMock) as spy:
+        reopened = await db.get_or_create_collection(
+            name="skip_migration_test",
+            schema=_TestDocument,
+            embedder_type=NullEmbedder,
+            document_loader=identity,
+            migration_required=False,
+        )
+
+    spy.assert_not_awaited()
+
+    found = await reopened.find_one({"id": {"$eq": "doc1"}})
+    assert found is not None
+    assert found["content"] == "existing content"
+
+
+async def test_that_get_or_create_collection_runs_per_row_migration_when_migration_required_is_true_or_omitted(
+    pgvector_db: object,
+) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    db = pgvector_db
+    assert isinstance(db, PostgresVectorDatabase)
+
+    async def identity(doc: BaseDocument) -> Optional[_TestDocument]:
+        return cast(_TestDocument, doc)
+
+    collection = await db.get_or_create_collection(
+        name="run_migration_test",
+        schema=_TestDocument,
+        embedder_type=NullEmbedder,
+        document_loader=identity,
+    )
+    await collection.insert_one(_make_doc("doc1", "content", "name"))
+
+    db._collections.pop("run_migration_test", None)
+    with patch.object(
+        db, "_do_load_and_migrate", new_callable=AsyncMock, return_value=(0, 0)
+    ) as spy_default:
+        await db.get_or_create_collection(
+            name="run_migration_test",
+            schema=_TestDocument,
+            embedder_type=NullEmbedder,
+            document_loader=identity,
+        )
+    spy_default.assert_awaited_once()
+
+    db._collections.pop("run_migration_test", None)
+    with patch.object(
+        db, "_do_load_and_migrate", new_callable=AsyncMock, return_value=(0, 0)
+    ) as spy_explicit:
+        await db.get_or_create_collection(
+            name="run_migration_test",
+            schema=_TestDocument,
+            embedder_type=NullEmbedder,
+            document_loader=identity,
+            migration_required=True,
+        )
+    spy_explicit.assert_awaited_once()
+
+
+async def test_that_get_or_create_collection_still_syncs_embedded_table_when_migration_skipped(
+    pgvector_db: object,
+) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    db = pgvector_db
+    assert isinstance(db, PostgresVectorDatabase)
+
+    async def identity(doc: BaseDocument) -> Optional[_TestDocument]:
+        return cast(_TestDocument, doc)
+
+    collection = await db.get_or_create_collection(
+        name="skip_still_sync_test",
+        schema=_TestDocument,
+        embedder_type=NullEmbedder,
+        document_loader=identity,
+    )
+
+    pool = db._get_pool()
+    await pool.execute(
+        f'INSERT INTO "{collection._unembedded_table}" (doc_id, content, checksum, metadata) '
+        f"VALUES ($1, $2, $3, $4::jsonb)",
+        "oob_doc",
+        "out-of-band content",
+        md5_checksum("out-of-band content"),
+        {"id": "oob_doc", "name": "oob"},
+    )
+
+    db._collections.pop("skip_still_sync_test", None)
+    with patch.object(
+        db, "_do_load_and_migrate", new_callable=AsyncMock, return_value=(0, 0)
+    ) as migrate_spy:
+        reopened = await db.get_or_create_collection(
+            name="skip_still_sync_test",
+            schema=_TestDocument,
+            embedder_type=NullEmbedder,
+            document_loader=identity,
+            migration_required=False,
+        )
+
+    # Sync ran (oob doc made it into the embedded table) without migration running.
+    migrate_spy.assert_not_awaited()
+    found = await reopened.find_one({"id": {"$eq": "oob_doc"}})
+    assert found is not None
+    assert found["content"] == "out-of-band content"
+
+
+async def test_that_get_collection_skips_per_row_migration_when_migration_required_is_false(
+    pgvector_db: object,
+) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    db = pgvector_db
+    assert isinstance(db, PostgresVectorDatabase)
+
+    async def identity(doc: BaseDocument) -> Optional[_TestDocument]:
+        return cast(_TestDocument, doc)
+
+    collection = await db.get_or_create_collection(
+        name="get_skip_test",
+        schema=_TestDocument,
+        embedder_type=NullEmbedder,
+        document_loader=identity,
+    )
+    await collection.insert_one(_make_doc("doc1", "content", "name"))
+    db._collections.pop("get_skip_test", None)
+
+    with patch.object(db, "_do_load_and_migrate", new_callable=AsyncMock) as spy:
+        await db.get_collection(
+            "get_skip_test",
+            _TestDocument,
+            NullEmbedder,
+            identity,
+            migration_required=False,
+        )
+    spy.assert_not_awaited()
+
+
+async def test_that_vector_document_store_migration_helper_exposes_migration_required_after_aenter(
+    pgvector_db: object,
+) -> None:
+    from parlant.core.persistence.vector_database_helper import (
+        VectorDocumentStoreMigrationHelper,
+    )
+
+    db = pgvector_db
+    assert isinstance(db, PostgresVectorDatabase)
+
+    class _StubVersionedStore:
+        VERSION = Version.from_string("1.0.0")
+
+    original_version = _StubVersionedStore.VERSION
+    try:
+        async with VectorDocumentStoreMigrationHelper(
+            store=cast(Any, _StubVersionedStore()),
+            database=db,
+            allow_migration=True,
+        ) as helper:
+            assert helper.migration_required is False
+
+        async with VectorDocumentStoreMigrationHelper(
+            store=cast(Any, _StubVersionedStore()),
+            database=db,
+            allow_migration=True,
+        ) as helper:
+            assert helper.migration_required is False
+
+        _StubVersionedStore.VERSION = Version.from_string("2.0.0")
+        async with VectorDocumentStoreMigrationHelper(
+            store=cast(Any, _StubVersionedStore()),
+            database=db,
+            allow_migration=True,
+        ) as helper:
+            assert helper.migration_required is True
+
+        # After the bump-and-migrate cycle finishes, __aexit__ must have
+        # stamped the new version on the per-store key. The next boot at the
+        # same version must therefore see migration_required=False — otherwise
+        # the per-row walk repeats every warm start after any version bump.
+        async with VectorDocumentStoreMigrationHelper(
+            store=cast(Any, _StubVersionedStore()),
+            database=db,
+            allow_migration=True,
+        ) as helper:
+            assert helper.migration_required is False
+    finally:
+        _StubVersionedStore.VERSION = original_version

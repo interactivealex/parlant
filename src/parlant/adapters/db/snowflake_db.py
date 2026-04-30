@@ -190,7 +190,9 @@ class SnowflakeDocumentDatabase(DocumentDatabase):
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> SnowflakeDocumentCollection[TDocument]:
+        del migration_required
         return await self._get_or_create_initialized_collection(
             name,
             schema,
@@ -202,8 +204,9 @@ class SnowflakeDocumentDatabase(DocumentDatabase):
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> SnowflakeDocumentCollection[TDocument]:
-        return await self.get_collection(name, schema, document_loader)
+        return await self.get_collection(name, schema, document_loader, migration_required)
 
     async def delete_collection(self, name: str) -> None:
         table = self._table_identifier(name)

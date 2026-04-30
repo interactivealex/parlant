@@ -65,7 +65,9 @@ class TransientDocumentDatabase(DocumentDatabase):
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> TransientDocumentCollection[TDocument]:
+        del migration_required
         if name in self._collections:
             return cast(TransientDocumentCollection[TDocument], self._collections[name])
         raise ValueError(f'Collection "{name}" does not exist')
@@ -76,7 +78,9 @@ class TransientDocumentDatabase(DocumentDatabase):
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> TransientDocumentCollection[TDocument]:
+        del migration_required
         if collection := self._collections.get(name):
             return cast(TransientDocumentCollection[TDocument], collection)
 

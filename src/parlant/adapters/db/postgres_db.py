@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 from typing import Any, Awaitable, Callable, Optional, Sequence, cast
 
 from typing_extensions import override, Self
@@ -378,6 +379,7 @@ class PostgresDocumentDatabase(DocumentDatabase):
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[TDocument | None]],
+        migration_required: bool = True,
     ) -> DocumentCollection[TDocument]:
         pool = self._get_pool()
         table = self._table_name(name)
@@ -385,14 +387,26 @@ class PostgresDocumentDatabase(DocumentDatabase):
         if not await self._table_exists(table):
             raise ValueError(f'Collection "{name}" does not exist.')
 
-        # Acquire advisory lock so concurrent workers don't duplicate migration work
-        lock_id = self._advisory_lock_id(table)
-        async with pool.acquire() as lock_conn:
-            await lock_conn.execute("SELECT pg_advisory_lock($1)", lock_id)
-            try:
-                await self._run_migration(pool, table, name, document_loader)
-            finally:
-                await lock_conn.execute("SELECT pg_advisory_unlock($1)", lock_id)
+        if migration_required:
+            # Acquire advisory lock so concurrent workers don't duplicate migration work
+            lock_id = self._advisory_lock_id(table)
+            async with pool.acquire() as lock_conn:
+                await lock_conn.execute("SELECT pg_advisory_lock($1)", lock_id)
+                try:
+                    start = time.perf_counter()
+                    walked, updated = await self._run_migration(pool, table, name, document_loader)
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    log = self._logger.info if walked else self._logger.debug
+                    log(
+                        f"[postgres:{name}] migration: "
+                        f"walked={walked} updated={updated} in {elapsed_ms:.0f} ms"
+                    )
+                finally:
+                    await lock_conn.execute("SELECT pg_advisory_unlock($1)", lock_id)
+        else:
+            self._logger.info(
+                f"[postgres:{name}] skipping per-row migration (store version unchanged)"
+            )
 
         collection: PostgresDocumentCollection[TDocument] = PostgresDocumentCollection(
             pool=pool,
@@ -410,11 +424,13 @@ class PostgresDocumentDatabase(DocumentDatabase):
         table: str,
         name: str,
         document_loader: Callable[[BaseDocument], Awaitable[TDocument | None]],
-    ) -> None:
+    ) -> tuple[int, int]:
         """Run document migration/loading (must be called under advisory lock).
 
         Streams rows in batches via a server-side cursor to avoid loading
         the entire collection into memory.
+
+        Returns ``(walked, updated)`` for diagnostics.
         """
         failed_table = self._table_name(f"{name}_failed_migrations")
 
@@ -425,6 +441,8 @@ class PostgresDocumentDatabase(DocumentDatabase):
 
         failed_collection: Optional[DocumentCollection[TDocument]] = None
 
+        walked = 0
+        updated = 0
         # Process documents in batches using keyset pagination to keep memory bounded.
         last_id = ""
         while True:
@@ -436,12 +454,15 @@ class PostgresDocumentDatabase(DocumentDatabase):
             if not batch:
                 break
             last_id = batch[-1]["id"]
+            walked += len(batch)
 
             for row in batch:
                 doc = self._row_to_document(row)
                 try:
                     if loaded_doc := await document_loader(doc):
-                        await self._replace_document(pool, table, doc["id"], loaded_doc)
+                        if loaded_doc != doc:
+                            await self._replace_document(pool, table, doc["id"], loaded_doc)
+                            updated += 1
                         continue
 
                     if failed_collection is None:
@@ -472,19 +493,22 @@ class PostgresDocumentDatabase(DocumentDatabase):
                     await failed_collection.insert_one(cast(TDocument, doc))
                     await pool.execute(f'DELETE FROM "{table}" WHERE "id" = $1', doc["id"])
 
+        return walked, updated
+
     @override
     async def get_or_create_collection(
         self,
         name: str,
         schema: type[TDocument],
         document_loader: Callable[[BaseDocument], Awaitable[TDocument | None]],
+        migration_required: bool = True,
     ) -> DocumentCollection[TDocument]:
         table = self._table_name(name)
 
         if not await self._table_exists(table):
             return await self.create_collection(name, schema)
 
-        return await self.get_collection(name, schema, document_loader)
+        return await self.get_collection(name, schema, document_loader, migration_required)
 
     @override
     async def delete_collection(self, name: str) -> None:

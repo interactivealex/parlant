@@ -93,18 +93,19 @@ class VectorDocumentStoreMigrationHelper:
         self._runtime_store_version = store.VERSION.to_string()
         self._database = database
         self._allow_migration = allow_migration
+        self.migration_required: bool = False
 
     @staticmethod
     def get_store_version_key(store_name: str) -> str:
         return f"{store_name}_version"
 
     async def __aenter__(self) -> Self:
-        migration_required = await self._is_migration_required(
+        self.migration_required = await self._is_migration_required(
             self._database,
             self._runtime_store_version,
         )
 
-        if migration_required and not self._allow_migration:
+        if self.migration_required and not self._allow_migration:
             raise MigrationRequired(f"Migration required for {self._store_name}.")
 
         return self
@@ -146,7 +147,14 @@ class VectorDocumentStoreMigrationHelper:
         database: VectorDatabase,
         runtime_store_version: Version.String,
     ) -> None:
-        await database.upsert_metadata("version", runtime_store_version)
+        # Must use the same per-store key that ``_is_migration_required`` reads.
+        # The previous code wrote to a global "version" key which nothing reads,
+        # so the per-store key was set exactly once (at first boot) and never
+        # updated — causing migration to repeat on every warm start after any
+        # version bump.
+        await database.upsert_metadata(
+            self.get_store_version_key(self._store_name), runtime_store_version
+        )
 
 
 class VectorDocumentMigrationHelper(Generic[TDocument]):

@@ -238,7 +238,9 @@ class ChromaDatabase(VectorDatabase):
         schema: type[TDocument],
         embedder_type: type[Embedder],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> ChromaCollection[TDocument]:
+        del migration_required
         if collection := self._collections.get(name):
             return cast(ChromaCollection[TDocument], collection)
 
@@ -303,7 +305,9 @@ class ChromaDatabase(VectorDatabase):
         schema: type[TDocument],
         embedder_type: type[Embedder],
         document_loader: Callable[[BaseDocument], Awaitable[Optional[TDocument]]],
+        migration_required: bool = True,
     ) -> ChromaCollection[TDocument]:
+        del migration_required
         if collection := self._collections.get(name):
             return cast(ChromaCollection[TDocument], collection)
 
