@@ -723,14 +723,19 @@ OUTPUT FORMAT
                         # Conditions of the paths to child and forward
                         if c.conditions_to_child_and_forward:
                             for p in c.conditions_to_child_and_forward:
-                                path = (
+                                child_path = (
                                     children_info[c.child_id].id_to_reachable_follow_ups[p.id].path
                                 )
-                                path.insert(0, c.child_id)
+                                # Build a fresh list rather than insert() into the
+                                # child's stored path: that same list object is aliased
+                                # into every parent's children_info, so mutating it in
+                                # place corrupts it for the other parents of a fan-in
+                                # node and makes the result depend on the order in which
+                                # parents happen to be evaluated.
                                 reachable_follow_ups.append(
                                     _ReachableFollowUps(
                                         condition=p.condition_to_child_then_to_path,
-                                        path=path,
+                                        path=[c.child_id, *child_path],
                                     )
                                 )
                 # update field in graph node for parents evaluations
