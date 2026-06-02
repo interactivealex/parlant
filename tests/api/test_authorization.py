@@ -20,6 +20,7 @@ from parlant.api.authorization import (
     AuthorizationException,
     Operation,
     BasicRateLimiter,
+    ProductionAuthorizationPolicy,
 )
 
 
@@ -117,3 +118,63 @@ async def test_that_missing_client_ip_raises_authorization_exception() -> None:
 
     with pytest.raises(AuthorizationException):
         await limiter.check(request, Operation.LIST_EVENTS)
+
+
+def _default_limiter(policy: ProductionAuthorizationPolicy) -> BasicRateLimiter:
+    assert isinstance(policy.default_limiter, BasicRateLimiter)
+    return policy.default_limiter
+
+
+async def test_that_an_env_var_overrides_the_default_rate_limit_for_an_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARLANT_RATELIMIT_READ_AGENT", "50")
+
+    policy = ProductionAuthorizationPolicy()
+    limits = _default_limiter(policy).rate_limit_item_per_operation
+
+    assert limits[Operation.READ_AGENT] == RateLimitItemPerMinute(50)
+    # Operations without an override keep their built-in default.
+    assert limits[Operation.LIST_EVENTS] == RateLimitItemPerMinute(240)
+
+
+async def test_that_rate_limits_use_built_in_defaults_when_no_env_overrides_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for operation in (
+        Operation.READ_AGENT,
+        Operation.CREATE_GUEST_SESSION,
+        Operation.READ_SESSION,
+        Operation.LIST_EVENTS,
+        Operation.CREATE_CUSTOMER_EVENT,
+        Operation.CREATE_STATUS_EVENT,
+    ):
+        monkeypatch.delenv(f"PARLANT_RATELIMIT_{operation.name}", raising=False)
+
+    policy = ProductionAuthorizationPolicy()
+    limits = _default_limiter(policy).rate_limit_item_per_operation
+
+    assert limits[Operation.READ_AGENT] == RateLimitItemPerMinute(30)
+    assert limits[Operation.CREATE_GUEST_SESSION] == RateLimitItemPerMinute(10)
+    assert limits[Operation.READ_SESSION] == RateLimitItemPerMinute(30)
+    assert limits[Operation.LIST_EVENTS] == RateLimitItemPerMinute(240)
+    assert limits[Operation.CREATE_CUSTOMER_EVENT] == RateLimitItemPerMinute(30)
+    assert limits[Operation.CREATE_STATUS_EVENT] == RateLimitItemPerMinute(60)
+
+
+async def test_that_an_invalid_rate_limit_env_var_raises_a_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARLANT_RATELIMIT_READ_AGENT", "not-a-number")
+
+    with pytest.raises(ValueError):
+        ProductionAuthorizationPolicy()
+
+
+async def test_that_a_non_positive_rate_limit_env_var_raises_a_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARLANT_RATELIMIT_READ_AGENT", "0")
+
+    with pytest.raises(ValueError):
+        ProductionAuthorizationPolicy()

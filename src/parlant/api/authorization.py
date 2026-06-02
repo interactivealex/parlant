@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Awaitable, Callable
@@ -211,6 +212,59 @@ class RateLimiter(ABC):
     ) -> bool: ...
 
 
+RATE_LIMIT_ENV_PREFIX = "PARLANT_RATELIMIT_"
+
+# Default per-minute rate limits applied by `ProductionAuthorizationPolicy`.
+# Each entry can be overridden at runtime via an environment variable named
+# `PARLANT_RATELIMIT_<OPERATION_NAME>` holding a positive integer interpreted as
+# requests per minute, e.g. `PARLANT_RATELIMIT_READ_AGENT=50`.
+DEFAULT_RATE_LIMITS_PER_MINUTE: dict[Operation, int] = {
+    Operation.READ_AGENT: 30,
+    Operation.CREATE_GUEST_SESSION: 10,
+    Operation.READ_SESSION: 30,
+    Operation.LIST_EVENTS: 240,
+    Operation.CREATE_CUSTOMER_EVENT: 30,
+    Operation.CREATE_STATUS_EVENT: 60,
+}
+
+
+def _rate_limits_from_env() -> dict[Operation, RateLimitItem]:
+    """Resolve per-operation rate limits, applying `PARLANT_RATELIMIT_*` overrides.
+
+    Each operation in `DEFAULT_RATE_LIMITS_PER_MINUTE` may be overridden by an
+    environment variable named `PARLANT_RATELIMIT_<OPERATION_NAME>` holding a
+    positive integer interpreted as requests per minute. Unset variables fall
+    back to the built-in default. Invalid values raise `ValueError` so that
+    misconfiguration fails fast at startup.
+    """
+    resolved: dict[Operation, RateLimitItem] = {}
+
+    for operation, default_per_minute in DEFAULT_RATE_LIMITS_PER_MINUTE.items():
+        env_var = f"{RATE_LIMIT_ENV_PREFIX}{operation.name}"
+        raw = os.environ.get(env_var)
+
+        if raw is None:
+            per_minute = default_per_minute
+        else:
+            try:
+                per_minute = int(raw)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid value for {env_var}: {raw!r}. "
+                    "Expected a positive integer (requests per minute)."
+                )
+
+            if per_minute < 1:
+                raise ValueError(
+                    f"Invalid value for {env_var}: {raw!r}. "
+                    "Expected a positive integer (requests per minute)."
+                )
+
+        resolved[operation] = RateLimitItemPerMinute(per_minute)
+
+    return resolved
+
+
 class ProductionAuthorizationPolicy(AuthorizationPolicy):
     def __init__(self) -> None:
         # This can be modified externally to install specific limiters
@@ -220,18 +274,13 @@ class ProductionAuthorizationPolicy(AuthorizationPolicy):
             Callable[[Request, Operation], Awaitable[bool]],
         ] = {}
 
-        # It is also possible to change or override the default limiter
-        # for this instance from outside this class (or in subclasses).
+        # The default per-operation rate limits come from
+        # DEFAULT_RATE_LIMITS_PER_MINUTE and can be overridden at runtime via
+        # PARLANT_RATELIMIT_<OPERATION_NAME> environment variables (see
+        # _rate_limits_from_env). You can also replace self.default_limiter
+        # entirely from outside this class or in subclasses.
         self.default_limiter: RateLimiter = BasicRateLimiter(
-            rate_limit_item_per_operation={
-                # Some reasonable defaults...
-                Operation.READ_AGENT: RateLimitItemPerMinute(30),
-                Operation.CREATE_GUEST_SESSION: RateLimitItemPerMinute(10),
-                Operation.READ_SESSION: RateLimitItemPerMinute(30),
-                Operation.LIST_EVENTS: RateLimitItemPerMinute(240),
-                Operation.CREATE_CUSTOMER_EVENT: RateLimitItemPerMinute(30),
-                Operation.CREATE_STATUS_EVENT: RateLimitItemPerMinute(60),
-            }
+            rate_limit_item_per_operation=_rate_limits_from_env(),
         )
 
     async def configure_app(self, app: FastAPI) -> FastAPI:
