@@ -12,15 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
-from unittest.mock import patch
 
 from parlant.adapters.nlp.qwen_service import (
     QwenService,
+    QwenEstimatingTokenizer,
+    Qwen_MAX,
     get_qwen_base_url,
     QWEN_REGION_BASE_URLS,
 )
+from parlant.core.common import DefaultBaseModel
+from parlant.core.loggers import StdoutLogger
+from parlant.core.meter import LocalMeter
+from parlant.core.tracer import LocalTracer
+
+
+class SampleSchema(DefaultBaseModel):
+    value: str = "ok"
 
 
 def test_that_missing_api_key_returns_error_message() -> None:
@@ -110,3 +122,64 @@ def test_that_qwen_base_url_env_var_works_alone() -> None:
     with patch.dict(os.environ, {"QWEN_BASE_URL": custom_url}, clear=True):
         url = get_qwen_base_url()
         assert url == custom_url
+
+
+def test_that_qwen_cached_tokens_are_read_from_usage_sub_attribute() -> None:
+    """getattr(response, 'usage.prompt_cache_hit_tokens', 0) always returns 0.
+    The correct form reads response.usage.prompt_tokens_details.cached_tokens."""
+    tracer = LocalTracer()
+    logger = StdoutLogger(tracer)
+    meter = LocalMeter(logger)
+
+    prompt_tokens_details = MagicMock()
+    prompt_tokens_details.cached_tokens = 9
+
+    usage = MagicMock()
+    usage.prompt_tokens = 20
+    usage.completion_tokens = 5
+    usage.prompt_tokens_details = prompt_tokens_details
+    usage.model_dump_json = MagicMock(return_value="{}")
+
+    message = MagicMock()
+    message.content = '{"value": "hello"}'
+    choice = MagicMock()
+    choice.message = message
+
+    fake_response = MagicMock()
+    fake_response.usage = usage
+    fake_response.choices = [choice]
+
+    with patch.dict(
+        os.environ,
+        {"DASHSCOPE_API_KEY": "fake-key", "QWEN_BASE_URL": "https://fake.api/v1"},
+    ):
+        gen: Any = Qwen_MAX.__new__(Qwen_MAX)
+        gen.logger = logger
+        gen.tracer = tracer
+        gen.meter = meter
+        gen.model_name = "qwen-max"
+        gen._tokenizer = QwenEstimatingTokenizer("qwen-max")
+        gen.schema = SampleSchema
+
+    async_create = AsyncMock(return_value=fake_response)
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = async_create
+    gen._client = mock_client
+
+    recorded_calls: list[tuple[Any, ...]] = []
+
+    async def fake_record_llm_metrics(*args: Any, **kwargs: Any) -> None:
+        recorded_calls.append((args, kwargs))
+
+    with patch(
+        "parlant.adapters.nlp.qwen_service.record_llm_metrics",
+        side_effect=fake_record_llm_metrics,
+    ):
+        result = asyncio.run(gen._do_generate("test prompt"))
+
+    assert recorded_calls, "record_llm_metrics must be called"
+    _, kwargs = recorded_calls[0]
+    assert kwargs.get("cached_input_tokens") == 9, (
+        f"cached_input_tokens should be 9, got {kwargs.get('cached_input_tokens')!r}"
+    )
+    assert result.info.usage.extra.get("cached_input_tokens") == 9

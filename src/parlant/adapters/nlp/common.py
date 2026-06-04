@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from typing import Any
+
 from parlant.core.meter import Counter, Meter
 
 
@@ -30,6 +32,20 @@ def normalize_json_output(raw_output: str) -> str:
         json_end = len(raw_output[json_start:])
 
     return raw_output[json_start : json_start + json_end].strip()
+
+
+def extract_cached_input_tokens(usage: Any) -> int:
+    """Return cached input tokens from an OpenAI-compatible usage object, or 0.
+
+    OpenAI-compatible providers report prompt-cache hits at
+    usage.prompt_tokens_details.cached_tokens; both levels may be absent or None.
+    """
+    if usage is None:
+        return 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is None:
+        return 0
+    return getattr(details, "cached_tokens", None) or 0
 
 
 _INPUT_TOKENS_COUNTER: Counter

@@ -14,7 +14,8 @@
 
 import os
 from lagom import Container
-from unittest.mock import patch, Mock
+from typing import Any
+from unittest.mock import patch, Mock, MagicMock
 import asyncio
 
 from parlant.adapters.nlp.zhipu_service import (
@@ -22,14 +23,15 @@ from parlant.adapters.nlp.zhipu_service import (
     ZhipuSchematicGenerator,
     ZhipuEmbedder,
     ZhipuModerationService,
+    ZhipuEstimatingTokenizer,
     GLM_4_Plus,
     GLM_4_Flash,
     GLM_4_Air,
     Embedding_3,
 )
-from parlant.core.loggers import Logger
-from parlant.core.meter import Meter
-from parlant.core.tracer import Tracer
+from parlant.core.loggers import Logger, StdoutLogger
+from parlant.core.meter import Meter, LocalMeter
+from parlant.core.tracer import Tracer, LocalTracer
 from parlant.core.common import DefaultBaseModel
 
 
@@ -278,3 +280,72 @@ def test_that_zhipu_service_returns_correct_moderation_service(
         # Verify it returns a ZhipuModerationService instance
         assert isinstance(moderation_service, ZhipuModerationService)
         assert moderation_service.model_name == "moderation"
+
+
+@patch("parlant.adapters.nlp.zhipu_service.ZhipuAI")
+def test_that_zhipu_do_generate_uses_asyncio_to_thread(
+    mock_zhipuai_class: Mock,
+) -> None:
+    """The ZhipuAI client is synchronous; _do_generate must wrap the call in
+    asyncio.to_thread so it does not block the event loop."""
+    tracer = LocalTracer()
+    logger = StdoutLogger(tracer)
+    meter = LocalMeter(logger)
+
+    usage = MagicMock()
+    usage.prompt_tokens = 10
+    usage.completion_tokens = 5
+    usage.total_tokens = 15
+
+    message = MagicMock()
+    message.content = '{"value": "hello"}'
+    choice = MagicMock()
+    choice.message = message
+
+    fake_response = MagicMock()
+    fake_response.usage = usage
+    fake_response.choices = [choice]
+
+    # The sync create() method should return the fake response directly
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = fake_response
+    mock_zhipuai_class.return_value = mock_client
+
+    with patch.dict(os.environ, {"ZHIPUAI_API_KEY": "test-api-key"}):
+        gen: Any = GLM_4_Flash.__new__(GLM_4_Flash)
+
+    from parlant.core.nlp.generation import BaseSchematicGenerator  # noqa: PLC0415
+
+    BaseSchematicGenerator.__init__(
+        gen,
+        logger=logger,
+        tracer=tracer,
+        meter=meter,
+        model_name="glm-4-flash",
+    )
+    gen._tokenizer = ZhipuEstimatingTokenizer("glm-4-flash")
+    gen.schema = type("MySchema", (object,), {"__name__": "MySchema"})  # type: ignore
+    gen._client = mock_client
+
+    to_thread_calls: list[Any] = []
+    original_to_thread = asyncio.to_thread
+
+    async def spy_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+        to_thread_calls.append(func)
+        return await original_to_thread(func, *args, **kwargs)
+
+    with patch("parlant.adapters.nlp.zhipu_service.asyncio.to_thread", side_effect=spy_to_thread):
+        # Import schema inline to avoid the type check on schema
+        from parlant.core.common import DefaultBaseModel  # noqa: PLC0415
+
+        class _Schema(DefaultBaseModel):
+            value: str = "hello"
+
+        gen.schema = _Schema
+        result = asyncio.run(gen._do_generate("test prompt"))
+
+    assert to_thread_calls, (
+        "asyncio.to_thread must be called; the zhipuai client is synchronous and "
+        "must not block the event loop"
+    )
+    assert result.content.value == "hello"

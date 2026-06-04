@@ -132,10 +132,10 @@ class CerebrasSchematicGenerator(BaseSchematicGenerator[T]):
 
         t_end = time.time()
 
-        if response.usage:  # type: ignore
-            self.logger.trace(response.usage.model_dump_json(indent=2))  # type: ignore
+        if response.usage:  # type: ignore[union-attr]
+            self.logger.trace(response.usage.model_dump_json(indent=2))  # type: ignore[union-attr]
 
-        raw_content = response.choices[0].message.content or "{}"  # type: ignore
+        raw_content = response.choices[0].message.content or "{}"  # type: ignore[union-attr,index]
 
         try:
             json_content = normalize_json_output(raw_content)
@@ -152,8 +152,9 @@ class CerebrasSchematicGenerator(BaseSchematicGenerator[T]):
             await record_llm_metrics(
                 self.meter,
                 self.model_name,
-                input_tokens=response.usage.prompt_tokens,  # type: ignore
-                output_tokens=response.usage.completion_tokens,  # type: ignore
+                schema_name=self.schema.__name__,
+                input_tokens=response.usage.prompt_tokens,  # type: ignore[union-attr]
+                output_tokens=response.usage.completion_tokens,  # type: ignore[union-attr]
             )
 
             return SchematicGenerationResult(
@@ -163,8 +164,8 @@ class CerebrasSchematicGenerator(BaseSchematicGenerator[T]):
                     model=self.id,
                     duration=(t_end - t_start),
                     usage=UsageInfo(
-                        input_tokens=response.usage.prompt_tokens,  # type: ignore
-                        output_tokens=response.usage.completion_tokens,  # type: ignore
+                        input_tokens=response.usage.prompt_tokens,  # type: ignore[union-attr]
+                        output_tokens=response.usage.completion_tokens,  # type: ignore[union-attr]
                         extra={},
                     ),
                 ),
@@ -236,7 +237,7 @@ class CerebrasService(NLPService):
 
         if not os.environ.get("CEREBRAS_API_KEY"):
             return """\
-You're using the OpenAI NLP service, but CEREBRAS_API_KEY is not set.
+You're using the Cerebras NLP service, but CEREBRAS_API_KEY is not set.
 Please set CEREBRAS_API_KEY in your environment before running Parlant.
 """
 

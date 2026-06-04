@@ -211,15 +211,27 @@ class BedrockService(NLPService):
     def verify_environment() -> str | None:
         """Returns an error message if the environment is not set up correctly."""
 
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            return """\
-You're using the AWS Bedrock NLP service, but some environment variables are missing.
-Please consider setting the following your environment before running Parlant.
+        has_key_credentials = os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get(
+            "AWS_SECRET_ACCESS_KEY"
+        )
+        has_profile = os.environ.get("AWS_PROFILE")
+        has_bearer_token = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
 
-- AWS_ACCESS_KEY_ID
-- AWS_SECRET_ACCESS_KEY
-- AWS_REGION
-- AWS_SESSION_TOKEN
+        if not (has_key_credentials or has_profile or has_bearer_token):
+            return """\
+You're using the AWS Bedrock NLP service, but AWS credentials are not set.
+Please configure one of the following authentication methods before running Parlant:
+
+Option 1 — Static credentials:
+  export AWS_ACCESS_KEY_ID="<your_access_key_id>"
+  export AWS_SECRET_ACCESS_KEY="<your_secret_access_key>"
+  export AWS_REGION="<your_aws_region>"   # e.g. us-east-1
+
+Option 2 — Named profile:
+  export AWS_PROFILE="<your_profile_name>"
+
+Option 3 — Bearer token (Bedrock-specific):
+  export AWS_BEARER_TOKEN_BEDROCK="<your_bearer_token>"
 """
         return None
 

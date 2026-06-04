@@ -128,7 +128,7 @@ class FireworksSchematicGenerator(BaseSchematicGenerator[T]):
 
         t_start = time.time()
         try:
-            response = self._client.chat.completions.create(
+            response = await self._client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model_name,
                 response_format={
@@ -147,10 +147,10 @@ class FireworksSchematicGenerator(BaseSchematicGenerator[T]):
 
         t_end = time.time()
 
-        if response.usage:  # type: ignore
-            self.logger.trace(f"Usage: {response.usage.model_dump_json(indent=2)}")  # type: ignore
+        if response.usage:
+            self.logger.trace(f"Usage: {response.usage.model_dump_json(indent=2)}")
 
-        raw_content = response.choices[0].message.content or "{}"  # type: ignore
+        raw_content = response.choices[0].message.content or "{}"
 
         try:
             json_content = normalize_json_output(raw_content)
@@ -167,8 +167,9 @@ class FireworksSchematicGenerator(BaseSchematicGenerator[T]):
             await record_llm_metrics(
                 self.meter,
                 self.model_name,
-                input_tokens=response.usage.prompt_tokens,  # type: ignore
-                output_tokens=response.usage.completion_tokens,  # type: ignore
+                schema_name=self.schema.__name__,
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
             )
 
             return SchematicGenerationResult(
@@ -178,8 +179,8 @@ class FireworksSchematicGenerator(BaseSchematicGenerator[T]):
                     model=self.id,
                     duration=(t_end - t_start),
                     usage=UsageInfo(
-                        input_tokens=response.usage.prompt_tokens,  # type: ignore
-                        output_tokens=response.usage.completion_tokens,  # type: ignore
+                        input_tokens=response.usage.prompt_tokens,
+                        output_tokens=response.usage.completion_tokens,
                         extra={},
                     ),
                 ),

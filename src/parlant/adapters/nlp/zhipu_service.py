@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from __future__ import annotations
+import asyncio
 from itertools import chain
 import time
 from parlant.core.engines.alpha.guideline_matching.generic.journey.journey_backtrack_node_selection import (
@@ -215,7 +216,8 @@ class ZhipuSchematicGenerator(BaseSchematicGenerator[T]):
         t_start = time.time()
 
         try:
-            response = self._client.chat.completions.create(
+            response = await asyncio.to_thread(
+                self._client.chat.completions.create,
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model_name,
                 response_format={"type": "json_object"},

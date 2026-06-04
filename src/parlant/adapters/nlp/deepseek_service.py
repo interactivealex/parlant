@@ -32,7 +32,11 @@ import os
 from pydantic import ValidationError
 import tiktoken
 
-from parlant.adapters.nlp.common import normalize_json_output, record_llm_metrics
+from parlant.adapters.nlp.common import (
+    extract_cached_input_tokens,
+    normalize_json_output,
+    record_llm_metrics,
+)
 from parlant.adapters.nlp.hugging_face import JinaAIEmbedder
 from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.loggers import Logger
@@ -163,17 +167,15 @@ class DeepSeekSchematicGenerator(BaseSchematicGenerator[T]):
 
             assert response.usage
 
+            cached_input_tokens = extract_cached_input_tokens(response.usage)
+
             await record_llm_metrics(
                 self.meter,
                 self.model_name,
                 schema_name=self.schema.__name__,
                 input_tokens=response.usage.prompt_tokens,
                 output_tokens=response.usage.completion_tokens,
-                cached_input_tokens=getattr(
-                    response,
-                    "usage.prompt_cache_hit_tokens",
-                    0,
-                ),
+                cached_input_tokens=cached_input_tokens,
             )
 
             return SchematicGenerationResult(
@@ -185,13 +187,7 @@ class DeepSeekSchematicGenerator(BaseSchematicGenerator[T]):
                     usage=UsageInfo(
                         input_tokens=response.usage.prompt_tokens,
                         output_tokens=response.usage.completion_tokens,
-                        extra={
-                            "cached_input_tokens": getattr(
-                                response,
-                                "usage.prompt_cache_hit_tokens",
-                                0,
-                            )
-                        },
+                        extra={"cached_input_tokens": cached_input_tokens},
                     ),
                 ),
             )

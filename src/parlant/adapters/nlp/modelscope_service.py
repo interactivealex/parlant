@@ -117,7 +117,7 @@ class ModelScopeSchematicGenerator(BaseSchematicGenerator[T]):
         ]
     )
     @override
-    async def generate(
+    async def do_generate(
         self,
         prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
