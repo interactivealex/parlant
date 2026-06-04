@@ -217,11 +217,13 @@ class GLMSchematicGenerator(BaseSchematicGenerator[T]):
 
         glm_api_arguments = {k: v for k, v in hints.items() if k in self.supported_glm_params}
 
+        # GLM requires max_tokens; honor the hint, else a safe default.
+        glm_api_arguments.setdefault("max_tokens", 4096)
+
         t_start = time.time()
         response = await self._client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model=self.model_name,
-            max_tokens=4096,
             response_format={"type": "json_object"},
             **glm_api_arguments,
         )

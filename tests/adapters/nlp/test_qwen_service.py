@@ -12,15 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
 import pytest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock, MagicMock
+from lagom import Container
 
 from parlant.adapters.nlp.qwen_service import (
     QwenService,
     get_qwen_base_url,
     QWEN_REGION_BASE_URLS,
 )
+from parlant.core.common import DefaultBaseModel
+from parlant.core.loggers import Logger, StdoutLogger
+from parlant.core.meter import Meter, LocalMeter
+from parlant.core.tracer import Tracer, LocalTracer
+
+
+@pytest.fixture
+def container() -> Container:
+    c = Container()
+    tracer = LocalTracer()
+    logger = StdoutLogger(tracer)
+    meter = LocalMeter(logger)
+    c[Logger] = logger
+    c[Tracer] = tracer
+    c[Meter] = meter
+    return c
+
+
+class QwenSimpleSchema(DefaultBaseModel):
+    answer: str
+
+
+def _make_openai_response(content: str) -> MagicMock:
+    response = MagicMock()
+    response.choices[0].message.content = content
+    usage = MagicMock()
+    usage.prompt_tokens = 10
+    usage.completion_tokens = 5
+    response.usage = usage
+    return response
 
 
 def test_that_missing_api_key_returns_error_message() -> None:
@@ -110,3 +142,61 @@ def test_that_qwen_base_url_env_var_works_alone() -> None:
     with patch.dict(os.environ, {"QWEN_BASE_URL": custom_url}, clear=True):
         url = get_qwen_base_url()
         assert url == custom_url
+
+
+def test_that_qwen_generator_does_not_raise_with_max_tokens_hint(
+    container: Container,
+) -> None:
+    """Passing hints={'max_tokens': 1000} must not raise TypeError (duplicate kwarg)."""
+    from parlant.adapters.nlp.qwen_service import Qwen_Plus
+
+    with patch.dict(
+        os.environ,
+        {"DASHSCOPE_API_KEY": "test-key"},
+        clear=False,
+    ):
+        # Use bracket syntax so __orig_class__ is set (required for .schema property)
+        gen = Qwen_Plus[QwenSimpleSchema](
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=container[Meter],
+        )
+
+        mock_response = _make_openai_response('{"answer": "42"}')
+        mock_create = AsyncMock(return_value=mock_response)
+
+        with patch.object(gen._client.chat.completions, "create", mock_create):
+            # Must not raise TypeError: got multiple values for keyword argument 'max_tokens'
+            asyncio.run(gen._do_generate("test prompt", hints={"max_tokens": 1000}))
+
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs.get("max_tokens") == 1000
+
+
+def test_that_qwen_generator_uses_default_max_tokens_when_not_in_hints(
+    container: Container,
+) -> None:
+    """When hints do not include max_tokens, the call should still include a max_tokens value."""
+    from parlant.adapters.nlp.qwen_service import Qwen_Plus
+
+    with patch.dict(
+        os.environ,
+        {"DASHSCOPE_API_KEY": "test-key"},
+        clear=False,
+    ):
+        # Use bracket syntax so __orig_class__ is set (required for .schema property)
+        gen = Qwen_Plus[QwenSimpleSchema](
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=container[Meter],
+        )
+
+        mock_response = _make_openai_response('{"answer": "42"}')
+        mock_create = AsyncMock(return_value=mock_response)
+
+        with patch.object(gen._client.chat.completions, "create", mock_create):
+            asyncio.run(gen._do_generate("test prompt", hints={}))
+
+        call_kwargs = mock_create.call_args[1]
+        # A default must be present — Qwen/DashScope requires max_tokens
+        assert "max_tokens" in call_kwargs

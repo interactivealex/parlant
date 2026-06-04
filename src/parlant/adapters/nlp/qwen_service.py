@@ -239,11 +239,14 @@ class QwenSchematicGenerator(BaseSchematicGenerator[T]):
 
         qwen_api_arguments = {k: v for k, v in hints.items() if k in self.supported_qwen_params}
 
+        # DashScope/Qwen requires max_tokens; honor the hint, else a default that
+        # fits all current qwen-max/plus/2.5 models (min documented max-output: 8192).
+        qwen_api_arguments.setdefault("max_tokens", 8 * 1024)
+
         t_start = time.time()
         response = await self._client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model=self.model_name,
-            max_tokens=8 * 1024,
             response_format={"type": "json_object"},
             **qwen_api_arguments,
         )

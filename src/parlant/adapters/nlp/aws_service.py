@@ -64,7 +64,14 @@ class AnthropicBedrockEstimatingTokenizer(EstimatingTokenizer):
 
 
 class AnthropicBedrockAISchematicGenerator(BaseSchematicGenerator[T]):
-    supported_hints = ["temperature"]
+    # Anthropic's API requires max_tokens on every request.  This constant is
+    # the maximum *output* token budget for claude-3-5-sonnet on Bedrock (8 192).
+    # It is intentionally separate from the context-window capacity exposed by
+    # the max_tokens property below (200 k), which is used only for tokenizer
+    # budget estimation.
+    DEFAULT_MAX_OUTPUT_TOKENS: int = 8192
+
+    supported_hints = ["temperature", "max_tokens"]
 
     def __init__(
         self,
@@ -126,12 +133,14 @@ class AnthropicBedrockAISchematicGenerator(BaseSchematicGenerator[T]):
 
         anthropic_api_arguments = {k: v for k, v in hints.items() if k in self.supported_hints}
 
+        # Anthropic's API mandates max_tokens; honor the hint, else the default.
+        anthropic_api_arguments.setdefault("max_tokens", self.DEFAULT_MAX_OUTPUT_TOKENS)
+
         t_start = time.time()
         try:
             response = await self._client.messages.create(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model_name,
-                max_tokens=4096,
                 **anthropic_api_arguments,
             )
         except RateLimitError:

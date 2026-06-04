@@ -129,12 +129,13 @@ class LiteLLMSchematicGenerator(BaseSchematicGenerator[T]):
 
         t_start = time.time()
 
+        # max_tokens flows via litellm_api_arguments (from hints) when supplied;
+        # otherwise it is omitted so the provider default applies.
         response = await self._client.acompletion(
             base_url=self.base_url,
             api_key=api_key,
             messages=[{"role": "user", "content": prompt}],
             model=self.model_name,
-            max_tokens=5000,
             response_format={"type": "json_object"},
             **litellm_api_arguments,
         )

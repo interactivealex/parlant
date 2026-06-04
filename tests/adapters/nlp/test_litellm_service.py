@@ -14,7 +14,7 @@
 
 import asyncio
 import os
-from unittest.mock import patch, Mock
+from unittest.mock import patch, Mock, AsyncMock, MagicMock
 
 from lagom import Container
 
@@ -22,6 +22,7 @@ from parlant.adapters.nlp.litellm_service import (
     LiteLLMEmbedder,
     LiteLLMService,
 )
+from parlant.core.common import DefaultBaseModel
 from parlant.core.loggers import Logger
 from parlant.core.meter import Meter
 from parlant.core.tracer import Tracer
@@ -204,3 +205,82 @@ def test_that_api_key_is_optional_for_verify_environment() -> None:
     ):
         error = LiteLLMService.verify_environment()
         assert error is None
+
+
+class SimpleSchema(DefaultBaseModel):
+    value: str
+
+
+def _make_litellm_response(content: str) -> MagicMock:
+    """Build a minimal mock litellm response."""
+    response = MagicMock()
+    response.choices[0].message.content = content
+    usage = MagicMock()
+    usage.prompt_tokens = 10
+    usage.completion_tokens = 5
+    response.usage = usage
+    return response
+
+
+def test_that_litellm_generator_omits_max_tokens_when_not_in_hints(
+    container: Container,
+) -> None:
+    """When hints do not include max_tokens, acompletion must NOT receive a max_tokens kwarg."""
+    from parlant.adapters.nlp.litellm_service import LiteLLM_Default
+
+    with patch.dict(
+        os.environ,
+        {"LITELLM_PROVIDER_MODEL_NAME": "gpt-4"},
+        clear=False,
+    ):
+        # Use bracket syntax so __orig_class__ is set (required for .schema property)
+        gen = LiteLLM_Default[SimpleSchema](
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=container[Meter],
+            base_url=None,
+            model_name="gpt-4",
+        )
+
+        mock_response = _make_litellm_response('{"value": "hello"}')
+        mock_acompletion = AsyncMock(return_value=mock_response)
+
+        with patch.object(gen._client, "acompletion", mock_acompletion):
+            asyncio.run(gen.do_generate("test prompt", hints={}))
+
+        call_kwargs = mock_acompletion.call_args[1]
+        assert "max_tokens" not in call_kwargs, (
+            "max_tokens must not be sent when not in hints; got "
+            f"max_tokens={call_kwargs.get('max_tokens')}"
+        )
+
+
+def test_that_litellm_generator_uses_max_tokens_from_hints(
+    container: Container,
+) -> None:
+    """When hints include max_tokens, acompletion receives that exact value with no collision."""
+    from parlant.adapters.nlp.litellm_service import LiteLLM_Default
+
+    with patch.dict(
+        os.environ,
+        {"LITELLM_PROVIDER_MODEL_NAME": "gpt-4"},
+        clear=False,
+    ):
+        # Use bracket syntax so __orig_class__ is set (required for .schema property)
+        gen = LiteLLM_Default[SimpleSchema](
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=container[Meter],
+            base_url=None,
+            model_name="gpt-4",
+        )
+
+        mock_response = _make_litellm_response('{"value": "hello"}')
+        mock_acompletion = AsyncMock(return_value=mock_response)
+
+        with patch.object(gen._client, "acompletion", mock_acompletion):
+            # Must not raise TypeError: got multiple values for keyword argument 'max_tokens'
+            asyncio.run(gen.do_generate("test prompt", hints={"max_tokens": 1000}))
+
+        call_kwargs = mock_acompletion.call_args[1]
+        assert call_kwargs.get("max_tokens") == 1000
