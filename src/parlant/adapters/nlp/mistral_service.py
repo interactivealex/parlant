@@ -189,6 +189,9 @@ class MistralSchematicGenerator(BaseSchematicGenerator[T]):
 
             assert response.usage
 
+            # cached_input_tokens: mistralai SDK 1.x UsageInfo has no cache field
+            # (prompt_tokens, completion_tokens, total_tokens only).  Keep 0 until
+            # the Mistral API exposes cache hit counts in its usage payload.
             await record_llm_metrics(
                 self.meter,
                 self.model_name,

@@ -33,7 +33,7 @@ import os
 from pydantic import ValidationError
 import tiktoken
 
-from parlant.adapters.nlp.common import normalize_json_output
+from parlant.adapters.nlp.common import normalize_json_output, record_llm_metrics
 from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.loggers import Logger
 from parlant.core.meter import Meter
@@ -274,6 +274,22 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
 
             assert response.usage
 
+            cached_tokens = getattr(
+                response.usage,
+                "prompt_cache_hit_tokens",
+                None,
+            )
+            cached_input_tokens = cached_tokens if isinstance(cached_tokens, int) else 0
+
+            await record_llm_metrics(
+                self.meter,
+                self.model_name,
+                schema_name=self.schema.__name__,
+                input_tokens=response.usage.prompt_tokens or 0,
+                output_tokens=response.usage.completion_tokens or 0,
+                cached_input_tokens=cached_input_tokens,
+            )
+
             return SchematicGenerationResult(
                 content=content,
                 info=GenerationInfo(
@@ -281,14 +297,10 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
                     model=self.id,
                     duration=(t_end - t_start),
                     usage=UsageInfo(
-                        input_tokens=response.usage.prompt_tokens,
-                        output_tokens=response.usage.completion_tokens,
+                        input_tokens=response.usage.prompt_tokens or 0,
+                        output_tokens=response.usage.completion_tokens or 0,
                         extra={
-                            "cached_input_tokens": getattr(
-                                response.usage,
-                                "prompt_cache_hit_tokens",
-                                0,
-                            )
+                            "cached_input_tokens": cached_input_tokens,
                         },
                     ),
                 ),

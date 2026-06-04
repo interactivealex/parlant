@@ -13,6 +13,9 @@
 # limitations under the License.
 
 
+from typing import TypedDict
+import weakref
+
 from parlant.core.meter import Counter, Meter
 
 
@@ -32,10 +35,37 @@ def normalize_json_output(raw_output: str) -> str:
     return raw_output[json_start : json_start + json_end].strip()
 
 
-_INPUT_TOKENS_COUNTER: Counter
-_OUTPUT_TOKENS_COUNTER: Counter
-_CACHED_TOKENS_COUNTER: Counter
-_COUNTERS_INITIALIZED = False
+class _MeterCounters(TypedDict):
+    input_tokens: Counter
+    output_tokens: Counter
+    cached_input_tokens: Counter
+
+
+# Per-meter counter cache. Weak keys let short-lived meters (e.g. in tests) be
+# garbage-collected together with their counters.
+_METER_COUNTERS: weakref.WeakKeyDictionary[Meter, _MeterCounters] = weakref.WeakKeyDictionary()
+
+
+def _get_or_create_counters(meter: Meter) -> _MeterCounters:
+    """Return the three LLM counters for *meter*, creating them on first call."""
+    counters = _METER_COUNTERS.get(meter)
+    if counters is None:
+        counters = _MeterCounters(
+            input_tokens=meter.create_counter(
+                name="input_tokens",
+                description="Number of input tokens sent to a LLM model",
+            ),
+            output_tokens=meter.create_counter(
+                name="output_tokens",
+                description="Number of output tokens received from a LLM model",
+            ),
+            cached_input_tokens=meter.create_counter(
+                name="cached_input_tokens",
+                description="Number of input tokens served from cache for a LLM model",
+            ),
+        )
+        _METER_COUNTERS[meter] = counters
+    return counters
 
 
 async def record_llm_metrics(
@@ -46,38 +76,9 @@ async def record_llm_metrics(
     output_tokens: int,
     cached_input_tokens: int = 0,
 ) -> None:
-    global _COUNTERS_INITIALIZED
-    global _INPUT_TOKENS_COUNTER
-    global _OUTPUT_TOKENS_COUNTER
-    global _CACHED_TOKENS_COUNTER
+    counters = _get_or_create_counters(meter)
+    attributes = {"model_name": model_name, "schema_name": schema_name}
 
-    if not _COUNTERS_INITIALIZED:
-        _INPUT_TOKENS_COUNTER = meter.create_counter(
-            name="input_tokens",
-            description="Number of input tokens sent to a LLM model",
-        )
-        _OUTPUT_TOKENS_COUNTER = meter.create_counter(
-            name="output_tokens",
-            description="Number of output tokens received from a LLM model",
-        )
-        _CACHED_TOKENS_COUNTER = meter.create_counter(
-            name="cached_input_tokens",
-            description="Number of input tokens served from cache for a LLM model",
-        )
-
-        _COUNTERS_INITIALIZED = True
-
-    await _INPUT_TOKENS_COUNTER.increment(
-        input_tokens,
-        {"model_name": model_name, "schema_name": schema_name},
-    )
-
-    await _OUTPUT_TOKENS_COUNTER.increment(
-        output_tokens,
-        {"model_name": model_name, "schema_name": schema_name},
-    )
-
-    await _CACHED_TOKENS_COUNTER.increment(
-        cached_input_tokens,
-        {"model_name": model_name, "schema_name": schema_name},
-    )
+    await counters["input_tokens"].increment(input_tokens, attributes)
+    await counters["output_tokens"].increment(output_tokens, attributes)
+    await counters["cached_input_tokens"].increment(cached_input_tokens, attributes)

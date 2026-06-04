@@ -213,6 +213,9 @@ class CortexSchematicGenerator(BaseSchematicGenerator[T]):
 
         usage_block = data.get("usage") or {}
 
+        # cached_input_tokens: the Snowflake Cortex REST API returns only
+        # prompt_tokens and completion_tokens in its usage block (as of June 2026).
+        # No cache-hit token count is exposed; keep 0 until Snowflake adds it.
         await record_llm_metrics(
             self.meter,
             self.model_name,

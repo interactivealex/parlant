@@ -36,6 +36,8 @@ from parlant.core.common import DefaultBaseModel
 from parlant.core.meter import Meter
 from parlant.core.tracer import Tracer
 
+from tests.test_utilities import RecordingMeter
+
 
 class SchemaData(DefaultBaseModel):
     """Test schema for type checking."""
@@ -287,6 +289,102 @@ async def test_that_openrouter_generator_handles_successful_response(
         assert result.content.test_field == "test_value"
         assert result.info.usage.input_tokens == 10
         assert result.info.usage.output_tokens == 20
+
+
+async def test_that_openrouter_generator_records_metrics_on_successful_generation() -> None:
+    """record_llm_metrics must be called with correct token counts and schema_name."""
+    meter = RecordingMeter()
+
+    mock_response = Mock(spec=ChatCompletion)
+    mock_response.choices = [
+        Choice(
+            message=ChatCompletionMessage(role="assistant", content='{"test_field": "hello"}'),
+            finish_reason="stop",
+            index=0,
+        )
+    ]
+    mock_response.usage = CompletionUsage(prompt_tokens=15, completion_tokens=7, total_tokens=22)
+
+    with (
+        patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class,
+        patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False),
+    ):
+        from parlant.core.loggers import StdoutLogger
+        from parlant.core.tracer import LocalTracer
+
+        tracer = LocalTracer()
+        logger = StdoutLogger(tracer)
+
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=logger,
+            tracer=tracer,
+            meter=meter,
+        )
+
+        result = await generator.do_generate('{"test_field": "hello"}')
+
+    assert result.content.test_field == "hello"
+
+    # Counters must exist on the recording meter (not some other meter)
+    assert "input_tokens" in meter.counters
+    assert "output_tokens" in meter.counters
+    assert "cached_input_tokens" in meter.counters
+
+    input_call = meter.counters["input_tokens"].calls[0]
+    assert input_call[0] == 15
+    assert input_call[1] is not None
+    assert input_call[1]["schema_name"] == "SchemaData"
+    assert input_call[1]["model_name"] == "openai/gpt-4o"
+
+    output_call = meter.counters["output_tokens"].calls[0]
+    assert output_call[0] == 7
+
+
+async def test_that_openrouter_generator_records_zero_cached_tokens_when_absent() -> None:
+    """When the API response has no prompt_cache_hit_tokens, cached_input_tokens is 0."""
+    meter = RecordingMeter()
+
+    mock_response = Mock(spec=ChatCompletion)
+    mock_response.choices = [
+        Choice(
+            message=ChatCompletionMessage(role="assistant", content='{"test_field": "world"}'),
+            finish_reason="stop",
+            index=0,
+        )
+    ]
+    # CompletionUsage has no prompt_cache_hit_tokens attribute
+    mock_response.usage = CompletionUsage(prompt_tokens=5, completion_tokens=3, total_tokens=8)
+
+    with (
+        patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class,
+        patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False),
+    ):
+        from parlant.core.loggers import StdoutLogger
+        from parlant.core.tracer import LocalTracer
+
+        tracer = LocalTracer()
+        logger = StdoutLogger(tracer)
+
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=logger,
+            tracer=tracer,
+            meter=meter,
+        )
+
+        await generator.do_generate('{"test_field": "world"}')
+
+    cached_call = meter.counters["cached_input_tokens"].calls[0]
+    assert cached_call[0] == 0
 
 
 def test_that_openrouter_service_returns_correct_generator(container: Container) -> None:
