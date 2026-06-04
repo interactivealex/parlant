@@ -146,6 +146,8 @@ class VertexAIClaudeSchematicGenerator(BaseSchematicGenerator[T]):
             project_id=project_id,
             region=region,
         )
+        # Native structured output requires messages.parse (anthropic >= 0.83).
+        self._supports_native_output = hasattr(self._client.messages, "parse")
 
         self._genai_client = google.genai.Client(project=project_id, location=region, vertexai=True)
         self._tokenizer = VertexAIEstimatingTokenizer(self._genai_client, model_name)
@@ -199,39 +201,126 @@ class VertexAIClaudeSchematicGenerator(BaseSchematicGenerator[T]):
             prompt = prompt.build()
 
         anthropic_api_arguments = {k: v for k, v in hints.items() if k in self.supported_hints}
+        # Anthropic's API mandates max_tokens; honor the hint, else a safe default.
+        anthropic_api_arguments.setdefault("max_tokens", 8192)
 
+        if self._supports_native_output:
+            return await self._do_generate_native(prompt, anthropic_api_arguments)
+        return await self._do_generate_legacy(prompt, anthropic_api_arguments)
+
+    def _log_rate_limit_error(self) -> None:
+        self.logger.error(
+            "Vertex AI rate limit exceeded. Possible reasons:\n"
+            "1. Your GCP project may have insufficient quota.\n"
+            "2. The model may not be enabled in Vertex AI Model Garden.\n"
+            "3. You might have exceeded the requests-per-minute limit.\n\n"
+            "Recommended actions:\n"
+            "- Check your Vertex AI quotas in the GCP Console.\n"
+            "- Ensure the model is enabled in Vertex AI Model Garden.\n"
+            "- Review IAM permissions for the service account.\n"
+            "- Visit: https://console.cloud.google.com/vertex-ai/model-garden",
+        )
+
+    def _log_if_permission_error(self, e: Exception) -> None:
+        if "403" in str(e) or "permission" in str(e).lower():
+            self.logger.error(
+                f"Permission denied accessing Vertex AI. Ensure:\n"
+                f"1. ADC is properly configured (run 'gcloud auth application-default login')\n"
+                f"2. The service account has 'Vertex AI User' role\n"
+                f"3. The {self.model_name} model is enabled in Vertex AI Model Garden\n"
+                f"Error: {e}"
+            )
+
+    async def _do_generate_native(
+        self,
+        prompt: str,
+        api_arguments: dict[str, Any],
+    ) -> SchematicGenerationResult[T]:
+        """Generate via messages.parse with the schema enforced by the API."""
+        t_start = time.time()
+        try:
+            response = await self._client.messages.parse(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model_name,
+                output_format=self.schema,
+                **api_arguments,
+            )
+        except RateLimitError:
+            self._log_rate_limit_error()
+            raise
+        except (
+            APIConnectionError,
+            APITimeoutError,
+            APIResponseValidationError,
+            InternalServerError,
+        ):
+            raise
+        except Exception as e:
+            self._log_if_permission_error(e)
+            raise
+        t_end = time.time()
+
+        model_content: T | None = response.parsed_output  # type: ignore[assignment]
+        if model_content is None:
+            self.logger.debug(
+                f"messages.parse returned None parsed_output for {self.schema.__name__}; "
+                "validating raw text instead"
+            )
+            first_block = response.content[0] if response.content else None
+            raw_text = (
+                first_block.text
+                if first_block is not None and hasattr(first_block, "text")
+                else "{}"
+            )  # type: ignore[union-attr]
+            model_content = self.schema.model_validate_json(raw_text)
+
+        await record_llm_metrics(
+            self.meter,
+            self.model_name,
+            schema_name=self.schema.__name__,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
+
+        return SchematicGenerationResult(
+            content=model_content,
+            info=GenerationInfo(
+                schema_name=self.schema.__name__,
+                model=self.id,
+                duration=(t_end - t_start),
+                usage=UsageInfo(
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                ),
+            ),
+        )
+
+    async def _do_generate_legacy(
+        self,
+        prompt: str,
+        api_arguments: dict[str, Any],
+    ) -> SchematicGenerationResult[T]:
+        """Generate via messages.create and scrape JSON out of the raw text."""
         t_start = time.time()
         try:
             response = await self._client.messages.create(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model_name,
-                max_tokens=hints.get("max_tokens", 8192),
-                **anthropic_api_arguments,
+                **api_arguments,
             )
         except RateLimitError:
-            self.logger.error(
-                "Vertex AI rate limit exceeded. Possible reasons:\n"
-                "1. Your GCP project may have insufficient quota.\n"
-                "2. The model may not be enabled in Vertex AI Model Garden.\n"
-                "3. You might have exceeded the requests-per-minute limit.\n\n"
-                "Recommended actions:\n"
-                "- Check your Vertex AI quotas in the GCP Console.\n"
-                "- Ensure the model is enabled in Vertex AI Model Garden.\n"
-                "- Review IAM permissions for the service account.\n"
-                "- Visit: https://console.cloud.google.com/vertex-ai/model-garden",
-            )
+            self._log_rate_limit_error()
+            raise
+        except (
+            APIConnectionError,
+            APITimeoutError,
+            APIResponseValidationError,
+            InternalServerError,
+        ):
             raise
         except Exception as e:
-            if "403" in str(e) or "permission" in str(e).lower():
-                self.logger.error(
-                    f"Permission denied accessing Vertex AI. Ensure:\n"
-                    f"1. ADC is properly configured (run 'gcloud auth application-default login')\n"
-                    f"2. The service account has 'Vertex AI User' role\n"
-                    f"3. The {self.model_name} model is enabled in Vertex AI Model Garden\n"
-                    f"Error: {e}"
-                )
+            self._log_if_permission_error(e)
             raise
-
         t_end = time.time()
 
         raw_content = response.content[0].text
@@ -347,18 +436,22 @@ class VertexAIGeminiSchematicGenerator(BaseSchematicGenerator[T]):
             prompt = prompt.build()
 
         gemini_api_arguments = {k: v for k, v in hints.items() if k in self.supported_hints}
-        config = {
-            "response_mime_type": "application/json",
-            "response_schema": self.schema.model_json_schema(),
-            **gemini_api_arguments,
-        }
+
+        max_output_tokens: int | None = hints.get("max_tokens")
+
+        config = google.genai.types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=self.schema,
+            max_output_tokens=max_output_tokens,
+            **gemini_api_arguments,  # type: ignore
+        )
 
         t_start = time.time()
         try:
             response = await self._client.aio.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
-                config=cast(google.genai.types.GenerateContentConfigOrDict, config),
+                config=config,
             )
         except TooManyRequests:
             self.logger.error(
@@ -387,27 +480,33 @@ class VertexAIGeminiSchematicGenerator(BaseSchematicGenerator[T]):
 
         t_end = time.time()
 
-        raw_content = response.text
-
-        try:
-            json_content = normalize_json_output(raw_content or "{}")
-            # Fix Gemini's quote issues
-            json_content = json_content.replace(""", '"').replace(""", '"')
-
-            # Fix double-escaped sequences
-            for control_char in "utn":
-                json_content = json_content.replace(f"\\\\{control_char}", f"\\{control_char}")
-
-            json_object = jsonfinder.only_json(json_content)[2]
-        except Exception:
-            self.logger.error(f"Failed to extract JSON from {self.model_name}:\n{raw_content}")
-            raise
-
         if response.usage_metadata:
             self.logger.trace(response.usage_metadata.model_dump_json(indent=2))
 
         try:
-            model_content = self.schema.model_validate(json_object)
+            if response.parsed is not None:
+                self.logger.debug(f"Using response.parsed for {self.schema.__name__}")
+                model_content: T = cast(T, response.parsed)
+            else:
+                self.logger.debug(
+                    f"response.parsed is None; falling back to model_validate_json for {self.schema.__name__}"
+                )
+                model_content = self.schema.model_validate_json(response.text or "{}")
+
+            await record_llm_metrics(
+                self.meter,
+                self.model_name,
+                schema_name=self.schema.__name__,
+                input_tokens=response.usage_metadata.prompt_token_count or 0
+                if response.usage_metadata
+                else 0,
+                output_tokens=response.usage_metadata.candidates_token_count or 0
+                if response.usage_metadata
+                else 0,
+                cached_input_tokens=response.usage_metadata.cached_content_token_count or 0
+                if response.usage_metadata
+                else 0,
+            )
 
             return SchematicGenerationResult(
                 content=model_content,
@@ -424,7 +523,7 @@ class VertexAIGeminiSchematicGenerator(BaseSchematicGenerator[T]):
                                 if response.usage_metadata
                                 else 0
                             )
-                            or 0
+                            or 0,
                         },
                     )
                     if response.usage_metadata
@@ -432,7 +531,7 @@ class VertexAIGeminiSchematicGenerator(BaseSchematicGenerator[T]):
                 ),
             )
         except ValidationError:
-            self.logger.error(f"JSON from {self.model_name} doesn't match schema:\n{raw_content}")
+            self.logger.error(f"JSON from {self.model_name} doesn't match schema:\n{response.text}")
             raise
 
 
