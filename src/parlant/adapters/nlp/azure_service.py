@@ -19,6 +19,7 @@ from openai import (
     APIConnectionError,
     APIResponseValidationError,
     APITimeoutError,
+    BadRequestError,
     InternalServerError,
     RateLimitError,
 )  # type: ignore
@@ -31,7 +32,11 @@ import os
 from pydantic import ValidationError
 import tiktoken
 
-from parlant.adapters.nlp.common import normalize_json_output, record_llm_metrics
+from parlant.adapters.nlp.common import (
+    GenerationRefusedError,
+    normalize_json_output,
+    record_llm_metrics,
+)
 from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.loggers import Logger
 from parlant.core.tracer import Tracer
@@ -85,6 +90,10 @@ class AzureSchematicGenerator(BaseSchematicGenerator[T]):
         self._client = client
         self._tokenizer = AzureEstimatingTokenizer(model_name=self.model_name)
 
+        # Set to True after a BadRequestError on the parse path so that
+        # subsequent calls skip directly to the json_object fallback.
+        self._strict_incompatible: bool = False
+
     @property
     def id(self) -> str:
         return f"azure/{self.model_name}"
@@ -128,6 +137,18 @@ class AzureSchematicGenerator(BaseSchematicGenerator[T]):
         with self.logger.scope(f"Azure LLM Request ({self.schema.__name__})"):
             return await self._do_generate(prompt, hints)
 
+    _AZURE_RATE_LIMIT_MESSAGE = (
+        "Azure API rate limit exceeded. Possible reasons:\n"
+        "1. Your account may have insufficient API credits.\n"
+        "2. You may be using a free-tier account with limited request capacity.\n"
+        "3. You might have exceeded the requests-per-minute limit for your account.\n\n"
+        "Recommended actions:\n"
+        "- Check your Azure account balance and billing status.\n"
+        "- Review your API usage limits in Azure's dashboard.\n"
+        "- For more details on rate limits and usage tiers, visit:\n"
+        "  https://learn.microsoft.com/en-us/azure/ai-services/openai/quotas-limits\n"
+    )
+
     async def _do_generate(
         self,
         prompt: str | PromptBuilder,
@@ -138,27 +159,38 @@ class AzureSchematicGenerator(BaseSchematicGenerator[T]):
 
         azure_api_arguments = self._list_arguments(hints)
 
-        if hints.get("strict", False):
+        # Default: native structured output via chat.completions.parse.
+        # Opt-out: hints={"strict": False} forces the legacy json_object path.
+        # Also falls back when _strict_incompatible is True (cached from a prior
+        # BadRequestError on this instance).
+        use_native = hints.get("strict", True) and not self._strict_incompatible
+
+        if use_native:
             t_start = time.time()
             try:
-                response = await self._client.beta.chat.completions.parse(
+                response = await self._client.chat.completions.parse(
                     messages=[{"role": "user", "content": prompt}],
                     model=self.model_name,
                     response_format=self.schema,
                     **azure_api_arguments,
                 )
             except RateLimitError:
-                self.logger.error(
-                    "Azure API rate limit exceeded. Possible reasons:\n"
-                    "1. Your account may have insufficient API credits.\n"
-                    "2. You may be using a free-tier account with limited request capacity.\n"
-                    "3. You might have exceeded the requests-per-minute limit for your account.\n\n"
-                    "Recommended actions:\n"
-                    "- Check your Azure account balance and billing status.\n"
-                    "- Review your API usage limits in Azure's dashboard.\n"
-                    "- For more details on rate limits and usage tiers, visit:\n"
-                    "  https://learn.microsoft.com/en-us/azure/ai-services/openai/quotas-limits\n",
-                )
+                self.logger.error(self._AZURE_RATE_LIMIT_MESSAGE)
+                raise
+            except BadRequestError as e:
+                error_text = str(e)
+                if (
+                    getattr(e, "param", None) == "response_format"
+                    or "response_format" in error_text
+                    or "json_schema" in error_text
+                ):
+                    self.logger.warning(
+                        f"Native structured output not supported for schema "
+                        f"{self.schema.__name__} on {self.model_name}: {e}. "
+                        "Falling back to json_object mode for this instance."
+                    )
+                    self._strict_incompatible = True
+                    return await self._do_generate_json_object(prompt, azure_api_arguments)
                 raise
 
             t_end = time.time()
@@ -166,20 +198,28 @@ class AzureSchematicGenerator(BaseSchematicGenerator[T]):
             if response.usage:
                 self.logger.trace(response.usage.model_dump_json(indent=2))
 
-            parsed_object = response.choices[0].message.parsed
+            message = response.choices[0].message
+            if message.refusal:
+                raise GenerationRefusedError(message.refusal)
+
+            parsed_object = message.parsed
             assert parsed_object
 
-            assert response.usage
+            input_tokens = response.usage.prompt_tokens if response.usage else 0
+            output_tokens = response.usage.completion_tokens if response.usage else 0
+            cached_tokens = (
+                response.usage.prompt_tokens_details.cached_tokens or 0
+                if response.usage and response.usage.prompt_tokens_details
+                else 0
+            )
 
             await record_llm_metrics(
                 self.meter,
                 self.model_name,
                 schema_name=self.schema.__name__,
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
-                cached_input_tokens=response.usage.prompt_tokens_details.cached_tokens or 0
-                if response.usage.prompt_tokens_details
-                else 0,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_input_tokens=cached_tokens,
             )
 
             return SchematicGenerationResult[T](
@@ -189,88 +229,88 @@ class AzureSchematicGenerator(BaseSchematicGenerator[T]):
                     model=self.id,
                     duration=(t_end - t_start),
                     usage=UsageInfo(
-                        input_tokens=response.usage.prompt_tokens,
-                        output_tokens=response.usage.completion_tokens,
-                        extra=(
-                            {
-                                "cached_input_tokens": response.usage.prompt_tokens_details.cached_tokens
-                                or 0
-                            }
-                            if response.usage.prompt_tokens_details
-                            else {}
-                        ),
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        extra={"cached_input_tokens": cached_tokens},
                     ),
                 ),
             )
 
         else:
-            t_start = time.time()
+            return await self._do_generate_json_object(prompt, azure_api_arguments)
 
-            try:
-                response = await self._client.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model=self.model_name,
-                    response_format={"type": "json_object"},
-                    **azure_api_arguments,
-                )
-            except RateLimitError:
-                self.logger.error(
-                    "Azure API rate limit exceeded. Possible reasons:\n"
-                    "1. Your account may have insufficient API credits.\n"
-                    "2. You may be using a free-tier account with limited request capacity.\n"
-                    "3. You might have exceeded the requests-per-minute limit for your account.\n\n"
-                    "Recommended actions:\n"
-                    "- Check your Azure account balance and billing status.\n"
-                    "- Review your API usage limits in Azure's dashboard.\n"
-                    "- For more details on rate limits and usage tiers, visit:\n"
-                    "  https://learn.microsoft.com/en-us/azure/ai-services/openai/quotas-limits\n",
-                )
-                raise
+    async def _do_generate_json_object(
+        self,
+        prompt: str,
+        azure_api_arguments: Mapping[str, Any],
+    ) -> SchematicGenerationResult[T]:
+        """Legacy json_object path — used when strict=False hint is passed or
+        after a schema-incompatibility fallback."""
+        t_start = time.time()
 
-            t_end = time.time()
+        try:
+            response = await self._client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model_name,
+                response_format={"type": "json_object"},
+                **azure_api_arguments,
+            )
+        except RateLimitError:
+            self.logger.error(self._AZURE_RATE_LIMIT_MESSAGE)
+            raise
 
-            if response.usage:
-                self.logger.trace(response.usage.model_dump_json(indent=2))
+        t_end = time.time()
 
-            raw_content = response.choices[0].message.content or "{}"
+        if response.usage:
+            self.logger.trace(response.usage.model_dump_json(indent=2))
 
-            try:
-                json_content = json.loads(normalize_json_output(raw_content))
-            except json.JSONDecodeError:
-                self.logger.warning(f"Invalid JSON returned by {self.model_name}:\n{raw_content})")
-                json_content = jsonfinder.only_json(raw_content)[2]
-                self.logger.warning("Found JSON content within model response; continuing...")
+        raw_content = response.choices[0].message.content or "{}"
 
-            try:
-                content = self.schema.model_validate(json_content)
+        try:
+            json_content = json.loads(normalize_json_output(raw_content))
+        except json.JSONDecodeError:
+            self.logger.warning(f"Invalid JSON returned by {self.model_name}:\n{raw_content})")
+            json_content = jsonfinder.only_json(raw_content)[2]
+            self.logger.warning("Found JSON content within model response; continuing...")
 
-                assert response.usage
+        try:
+            content = self.schema.model_validate(json_content)
 
-                return SchematicGenerationResult(
-                    content=content,
-                    info=GenerationInfo(
-                        schema_name=self.schema.__name__,
-                        model=self.id,
-                        duration=(t_end - t_start),
-                        usage=UsageInfo(
-                            input_tokens=response.usage.prompt_tokens,
-                            output_tokens=response.usage.completion_tokens,
-                            extra=(
-                                {
-                                    "cached_input_tokens": response.usage.prompt_tokens_details.cached_tokens
-                                    or 0
-                                }
-                                if response.usage.prompt_tokens_details
-                                else {}
-                            ),
-                        ),
+            input_tokens = response.usage.prompt_tokens if response.usage else 0
+            output_tokens = response.usage.completion_tokens if response.usage else 0
+            cached_tokens = (
+                response.usage.prompt_tokens_details.cached_tokens or 0
+                if response.usage and response.usage.prompt_tokens_details
+                else 0
+            )
+
+            await record_llm_metrics(
+                self.meter,
+                self.model_name,
+                schema_name=self.schema.__name__,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_input_tokens=cached_tokens,
+            )
+
+            return SchematicGenerationResult(
+                content=content,
+                info=GenerationInfo(
+                    schema_name=self.schema.__name__,
+                    model=self.id,
+                    duration=(t_end - t_start),
+                    usage=UsageInfo(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        extra={"cached_input_tokens": cached_tokens},
                     ),
-                )
-            except ValidationError:
-                self.logger.error(
-                    f"JSON content returned by {self.model_name} does not match expected schema:\n{raw_content}"
-                )
-                raise
+                ),
+            )
+        except ValidationError:
+            self.logger.error(
+                f"JSON content returned by {self.model_name} does not match expected schema:\n{raw_content}"
+            )
+            raise
 
 
 def create_azure_client() -> AsyncAzureOpenAI:

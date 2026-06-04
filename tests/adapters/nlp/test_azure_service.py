@@ -13,15 +13,20 @@
 # limitations under the License.
 
 import os
+from typing import Any
 from lagom import Container
 import pytest
-from unittest.mock import AsyncMock, patch, Mock
+from unittest.mock import AsyncMock, patch, Mock, MagicMock
 import asyncio
 
+from openai import BadRequestError
+
+from parlant.adapters.nlp.common import GenerationRefusedError
 from parlant.adapters.nlp.azure_service import (
     AzureService,
-    create_azure_client,
     AzureSchematicGenerator,
+    GPT_4o,
+    create_azure_client,
     CustomAzureSchematicGenerator,
     CustomAzureEmbedder,
     AzureTextEmbedding3Large,
@@ -33,10 +38,73 @@ from parlant.core.tracer import Tracer
 from parlant.core.meter import Meter
 
 
-class TestSchema(DefaultBaseModel):
-    """Test schema for type checking."""
+class SampleSchema(DefaultBaseModel):
+    """Sample schema for structured-output tests."""
 
-    pass
+    value: str = "default"
+
+
+def _make_usage(
+    prompt_tokens: int = 10,
+    completion_tokens: int = 5,
+    cached_tokens: int | None = 0,
+) -> MagicMock:
+    usage = MagicMock()
+    usage.prompt_tokens = prompt_tokens
+    usage.completion_tokens = completion_tokens
+    if cached_tokens is not None:
+        details = MagicMock()
+        details.cached_tokens = cached_tokens
+        usage.prompt_tokens_details = details
+    else:
+        usage.prompt_tokens_details = None
+    return usage
+
+
+def _make_parse_response(
+    parsed: Any,
+    refusal: str | None = None,
+    usage: Any = None,
+) -> MagicMock:
+    msg = MagicMock()
+    msg.parsed = parsed
+    msg.refusal = refusal
+    choice = MagicMock()
+    choice.message = msg
+    resp = MagicMock()
+    resp.choices = [choice]
+    resp.usage = usage if usage is not None else _make_usage()
+    return resp
+
+
+def _make_create_response(
+    content: str,
+    usage: Any = None,
+) -> MagicMock:
+    msg = MagicMock()
+    msg.content = content
+    choice = MagicMock()
+    choice.message = msg
+    resp = MagicMock()
+    resp.choices = [choice]
+    resp.usage = usage if usage is not None else _make_usage()
+    return resp
+
+
+def _make_azure_generator(container: Container) -> GPT_4o[SampleSchema]:  # type: ignore[type-arg]
+    mock_client = AsyncMock()
+    with patch("parlant.adapters.nlp.azure_service.create_azure_client", return_value=mock_client):
+        with patch.dict(
+            os.environ,
+            {"AZURE_ENDPOINT": "https://test.openai.azure.com/", "AZURE_API_KEY": "key"},
+            clear=False,
+        ):
+            gen: GPT_4o[SampleSchema] = GPT_4o[SampleSchema](  # type: ignore[assignment]
+                logger=container[Logger],
+                tracer=container[Tracer],
+                meter=container[Meter],
+            )
+    return gen
 
 
 def test_that_missing_azure_endpoint_returns_error_message() -> None:
@@ -205,7 +273,7 @@ def test_that_azure_schematic_generator_initializes_correctly(container: Contain
     ):
         with patch("parlant.adapters.nlp.azure_service.create_azure_client") as mock_create_client:
             mock_create_client.return_value = mock_client
-            generator: GPT_4o[TestSchema] = GPT_4o(
+            generator: GPT_4o[SampleSchema] = GPT_4o(
                 logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
             )
 
@@ -227,7 +295,7 @@ def test_that_azure_schematic_generator_supports_correct_parameters(container: C
     ):
         with patch("parlant.adapters.nlp.azure_service.create_azure_client") as mock_create_client:
             mock_create_client.return_value = mock_client
-            generator: GPT_4o[TestSchema] = GPT_4o(
+            generator: GPT_4o[SampleSchema] = GPT_4o(
                 logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
             )
 
@@ -252,7 +320,7 @@ def test_that_custom_azure_schematic_generator_initializes_correctly(
         {"AZURE_GENERATIVE_MODEL_NAME": "gpt-4o", "AZURE_GENERATIVE_MODEL_WINDOW": "4096"},
         clear=True,
     ):
-        generator: CustomAzureSchematicGenerator[TestSchema] = CustomAzureSchematicGenerator(
+        generator: CustomAzureSchematicGenerator[SampleSchema] = CustomAzureSchematicGenerator(
             logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
         )
 
@@ -267,7 +335,7 @@ def test_that_custom_azure_schematic_generator_uses_default_max_tokens(
     """Test CustomAzureSchematicGenerator with default max_tokens."""
     with patch.dict(os.environ, {"AZURE_GENERATIVE_MODEL_NAME": "gpt-4o"}, clear=True):
         with patch("parlant.adapters.nlp.azure_service.create_azure_client"):
-            generator: CustomAzureSchematicGenerator[TestSchema] = CustomAzureSchematicGenerator(
+            generator: CustomAzureSchematicGenerator[SampleSchema] = CustomAzureSchematicGenerator(
                 logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
             )
             assert generator.max_tokens == 4096  # Default value
@@ -350,7 +418,7 @@ def test_that_azure_service_returns_custom_schematic_generator_when_configured(
     )
 
     with patch.dict(os.environ, {"AZURE_GENERATIVE_MODEL_NAME": "gpt-4o"}, clear=True):
-        generator = asyncio.run(service.get_schematic_generator(TestSchema))
+        generator = asyncio.run(service.get_schematic_generator(SampleSchema))
         assert isinstance(generator, CustomAzureSchematicGenerator)
 
 
@@ -368,7 +436,7 @@ def test_that_azure_service_returns_default_schematic_generator_when_not_configu
     )
 
     with patch.dict(os.environ, {}, clear=True):
-        generator = asyncio.run(service.get_schematic_generator(TestSchema))
+        generator = asyncio.run(service.get_schematic_generator(SampleSchema))
         assert isinstance(generator, AzureSchematicGenerator)
         assert generator.model_name == "gpt-4o"
 
@@ -529,3 +597,223 @@ def test_that_api_key_authentication_takes_priority_over_azure_ad() -> None:
 
             error = AzureService.verify_environment()
             assert error is None  # Should succeed because API key is present
+
+
+# ---------------------------------------------------------------------------
+# Structured output (native parse path) tests
+# ---------------------------------------------------------------------------
+
+
+def test_that_azure_default_path_calls_parse_with_schema_class(container: Container) -> None:
+    """Default generation calls chat.completions.parse with the schema class."""
+    gen = _make_azure_generator(container)
+    parsed = SampleSchema(value="hello")
+    resp = _make_parse_response(parsed=parsed)
+
+    with patch.object(
+        gen._client.chat.completions,
+        "parse",
+        new_callable=AsyncMock,
+        return_value=resp,
+    ) as mock_parse:
+        result = asyncio.run(gen.do_generate("test prompt"))
+
+    mock_parse.assert_called_once()
+    call_kwargs = mock_parse.call_args.kwargs
+    assert call_kwargs["response_format"] is SampleSchema
+    assert result.content == parsed
+
+
+def test_that_azure_strict_false_hint_uses_json_object_create(container: Container) -> None:
+    """hints strict=False bypasses parse and uses json_object create."""
+    gen = _make_azure_generator(container)
+    resp = _make_create_response(content='{"value": "world"}')
+
+    with (
+        patch.object(
+            gen._client.chat.completions,
+            "parse",
+            new_callable=AsyncMock,
+        ) as mock_parse,
+        patch.object(
+            gen._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            return_value=resp,
+        ) as mock_create,
+    ):
+        result = asyncio.run(gen.do_generate("test prompt", hints={"strict": False}))
+
+    mock_parse.assert_not_called()
+    mock_create.assert_called_once()
+    call_kwargs = mock_create.call_args.kwargs
+    assert call_kwargs["response_format"] == {"type": "json_object"}
+    assert result.content.value == "world"
+
+
+def test_that_azure_bad_request_error_on_parse_falls_back_to_json_object(
+    container: Container,
+) -> None:
+    """BadRequestError on parse triggers json_object fallback and sets _strict_incompatible."""
+    gen = _make_azure_generator(container)
+    resp = _make_create_response(content='{"value": "fallback"}')
+
+    bad_request = BadRequestError(
+        message="Invalid schema for response_format",
+        response=MagicMock(status_code=400, headers={}),
+        body={"error": {"message": "Invalid schema for response_format"}},
+    )
+
+    with (
+        patch.object(
+            gen._client.chat.completions,
+            "parse",
+            new_callable=AsyncMock,
+            side_effect=bad_request,
+        ) as mock_parse,
+        patch.object(
+            gen._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            return_value=resp,
+        ) as mock_create,
+    ):
+        result = asyncio.run(gen.do_generate("test prompt"))
+
+    mock_parse.assert_called_once()
+    mock_create.assert_called_once()
+    assert result.content.value == "fallback"
+    assert gen._strict_incompatible is True
+
+
+def test_that_azure_second_call_after_bad_request_skips_parse(container: Container) -> None:
+    """After schema incompatibility is cached, parse is not called on subsequent requests."""
+    gen = _make_azure_generator(container)
+    resp = _make_create_response(content='{"value": "cached"}')
+
+    bad_request = BadRequestError(
+        message="Invalid schema for response_format",
+        response=MagicMock(status_code=400, headers={}),
+        body={"error": {"message": "Invalid schema for response_format"}},
+    )
+
+    with (
+        patch.object(
+            gen._client.chat.completions,
+            "parse",
+            new_callable=AsyncMock,
+            side_effect=bad_request,
+        ) as mock_parse,
+        patch.object(
+            gen._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            return_value=resp,
+        ) as mock_create,
+    ):
+        asyncio.run(gen.do_generate("first"))
+        asyncio.run(gen.do_generate("second"))
+
+    assert mock_parse.call_count == 1
+    assert mock_create.call_count == 2
+
+
+def test_that_azure_refusal_raises_generation_refused_error(container: Container) -> None:
+    """A refusal field on the message raises GenerationRefusedError."""
+    gen = _make_azure_generator(container)
+    resp = _make_parse_response(parsed=None, refusal="I cannot help with that.")
+
+    with patch.object(
+        gen._client.chat.completions,
+        "parse",
+        new_callable=AsyncMock,
+        return_value=resp,
+    ):
+        with pytest.raises(GenerationRefusedError) as exc_info:
+            asyncio.run(gen.do_generate("test prompt"))
+
+    assert "I cannot help with that." in str(exc_info.value)
+
+
+def test_that_azure_missing_usage_on_parse_path_does_not_crash(container: Container) -> None:
+    """Absent usage on parse path defaults to 0 tokens and does not raise."""
+    gen = _make_azure_generator(container)
+    parsed = SampleSchema(value="ok")
+    resp = _make_parse_response(parsed=parsed)
+    resp.usage = None
+
+    with patch.object(
+        gen._client.chat.completions,
+        "parse",
+        new_callable=AsyncMock,
+        return_value=resp,
+    ):
+        result = asyncio.run(gen.do_generate("test prompt"))
+
+    assert result.content == parsed
+    assert result.info.usage.input_tokens == 0
+    assert result.info.usage.output_tokens == 0
+
+
+def test_that_azure_missing_prompt_tokens_details_does_not_crash(container: Container) -> None:
+    """Absent prompt_tokens_details defaults cached_input_tokens to 0."""
+    gen = _make_azure_generator(container)
+    parsed = SampleSchema(value="ok")
+    resp = _make_parse_response(parsed=parsed, usage=_make_usage(cached_tokens=None))
+
+    with patch.object(
+        gen._client.chat.completions,
+        "parse",
+        new_callable=AsyncMock,
+        return_value=resp,
+    ):
+        result = asyncio.run(gen.do_generate("test prompt"))
+
+    assert result.content == parsed
+    assert result.info.usage.extra is not None
+    assert result.info.usage.extra.get("cached_input_tokens", -1) == 0
+
+
+def test_that_azure_missing_usage_on_json_object_path_does_not_crash(
+    container: Container,
+) -> None:
+    """Absent usage on json_object path defaults to 0 tokens."""
+    gen = _make_azure_generator(container)
+    resp = _make_create_response(content='{"value": "no-usage"}')
+    resp.usage = None
+
+    with patch.object(
+        gen._client.chat.completions,
+        "create",
+        new_callable=AsyncMock,
+        return_value=resp,
+    ):
+        result = asyncio.run(gen.do_generate("test prompt", hints={"strict": False}))
+
+    assert result.content.value == "no-usage"
+    assert result.info.usage.input_tokens == 0
+    assert result.info.usage.output_tokens == 0
+
+
+def test_that_azure_json_object_path_records_llm_metrics(container: Container) -> None:
+    """record_llm_metrics is called on the json_object path (previously missing)."""
+    gen = _make_azure_generator(container)
+    resp = _make_create_response(content='{"value": "metrics"}')
+
+    with (
+        patch.object(
+            gen._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            return_value=resp,
+        ),
+        patch(
+            "parlant.adapters.nlp.azure_service.record_llm_metrics",
+            new_callable=AsyncMock,
+        ) as mock_metrics,
+    ):
+        asyncio.run(gen.do_generate("test prompt", hints={"strict": False}))
+
+    mock_metrics.assert_called_once()
+    call_kwargs = mock_metrics.call_args.kwargs
+    assert call_kwargs["schema_name"] == SampleSchema.__name__

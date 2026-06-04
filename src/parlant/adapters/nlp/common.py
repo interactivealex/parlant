@@ -16,6 +16,14 @@
 from parlant.core.meter import Counter, Meter
 
 
+class GenerationRefusedError(Exception):
+    """Raised when the model refuses to generate content (refusal field is set)."""
+
+    def __init__(self, refusal: str) -> None:
+        super().__init__(f"Model refused to generate: {refusal}")
+        self.refusal = refusal
+
+
 def normalize_json_output(raw_output: str) -> str:
     json_start = raw_output.find("```json")
 
