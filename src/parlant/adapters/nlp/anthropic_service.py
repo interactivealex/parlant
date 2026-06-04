@@ -19,6 +19,7 @@ from anthropic import (
     APIResponseValidationError,
     APITimeoutError,
     AsyncAnthropic,
+    BadRequestError,
     InternalServerError,
     RateLimitError,
 )  # type: ignore
@@ -76,7 +77,11 @@ class AnthropicEstimatingTokenizer(EstimatingTokenizer):
 
 
 class AnthropicAISchematicGenerator(BaseSchematicGenerator[T]):
-    supported_hints = ["temperature"]
+    supported_hints = ["temperature", "max_tokens"]
+
+    # Per-model output token limit — conservative values matching documented limits.
+    # Subclasses override this; the base default is 8192 (safe minimum).
+    output_max_tokens: int = 8192
 
     def __init__(
         self,
@@ -89,6 +94,11 @@ class AnthropicAISchematicGenerator(BaseSchematicGenerator[T]):
 
         self._client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
         self._estimating_tokenizer = AnthropicEstimatingTokenizer(self._client, model_name)
+
+        # Tri-state: None = not yet decided, True = use native, False = use legacy
+        # Whether to use native structured outputs; flipped off permanently for
+        # this instance if the API rejects the schema.
+        self._use_native_structured_output = True
 
     @property
     @override
@@ -130,30 +140,113 @@ class AnthropicAISchematicGenerator(BaseSchematicGenerator[T]):
         if isinstance(prompt, PromptBuilder):
             prompt = prompt.build()
 
-        anthropic_api_arguments = {k: v for k, v in hints.items() if k in self.supported_hints}
+        max_tokens: int = (
+            int(hints["max_tokens"]) if "max_tokens" in hints else self.output_max_tokens
+        )
+        temperature: float | None = hints.get("temperature")
 
+        extra_kwargs: dict[str, Any] = {}
+        if temperature is not None:
+            extra_kwargs["temperature"] = temperature
+
+        if self._use_native_structured_output:
+            try:
+                return await self._do_generate_native(prompt, max_tokens, extra_kwargs)
+            except BadRequestError as exc:
+                # If the API rejects due to schema incompatibility, fall back permanently.
+                if self._is_schema_rejection(exc):
+                    self.logger.warning(
+                        f"Anthropic native structured-output rejected for schema "
+                        f"{self.schema.__name__} (model={self.model_name}): {exc}. "
+                        "Falling back to legacy JSON scraping for this instance."
+                    )
+                    self._use_native_structured_output = False
+                else:
+                    raise
+
+        return await self._do_generate_legacy(prompt, max_tokens, extra_kwargs)
+
+    def _is_schema_rejection(self, exc: BadRequestError) -> bool:
+        """Return True when the 400 is caused by schema/format incompatibility."""
+        msg = str(exc).lower()
+        return exc.status_code == 400 and any(
+            kw in msg for kw in ("schema", "output_config", "output_format")
+        )
+
+    async def _do_generate_native(
+        self,
+        prompt: str,
+        max_tokens: int,
+        extra_kwargs: dict[str, Any],
+    ) -> SchematicGenerationResult[T]:
+        t_start = time.time()
+        try:
+            response = await self._client.messages.parse(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model_name,
+                max_tokens=max_tokens,
+                output_format=self.schema,
+                **extra_kwargs,
+            )
+        except RateLimitError:
+            self._log_rate_limit_error()
+            raise
+
+        t_end = time.time()
+
+        if response.usage:
+            self.logger.trace(response.usage.model_dump_json(indent=2))
+
+        model_content = response.parsed_output
+        if model_content is None:
+            # Should not happen with a valid schema — fall through to ValidationError path.
+            raise ValidationError.from_exception_data(  # type: ignore[attr-defined]
+                title=self.schema.__name__,
+                input_type="python",
+                line_errors=[],
+            )
+
+        cached_input_tokens: int = response.usage.cache_read_input_tokens or 0
+
+        await record_llm_metrics(
+            self.meter,
+            self.model_name,
+            schema_name=self.schema.__name__,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cached_input_tokens=cached_input_tokens,
+        )
+
+        return SchematicGenerationResult(
+            content=model_content,
+            info=GenerationInfo(
+                schema_name=self.schema.__name__,
+                model=self.id,
+                duration=(t_end - t_start),
+                usage=UsageInfo(
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    extra={"cached_input_tokens": cached_input_tokens},
+                ),
+            ),
+        )
+
+    async def _do_generate_legacy(
+        self,
+        prompt: str,
+        max_tokens: int,
+        extra_kwargs: dict[str, Any],
+    ) -> SchematicGenerationResult[T]:
         t_start = time.time()
         try:
             response = await self._client.messages.create(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model_name,
-                max_tokens=4096,
-                **anthropic_api_arguments,
+                max_tokens=max_tokens,
+                **extra_kwargs,
             )
         except RateLimitError:
-            self.logger.error(
-                (
-                    "Anthropic API rate limit exceeded. Possible reasons:\n"
-                    "1. Your account may have insufficient API credits.\n"
-                    "2. You may be using a free-tier account with limited request capacity.\n"
-                    "3. You might have exceeded the requests-per-minute limit for your account.\n\n"
-                    "Recommended actions:\n"
-                    "- Check your Anthropic account balance and billing status.\n"
-                    "- Review your API usage limits in Anthropic's dashboard.\n"
-                    "- For more details on rate limits and usage tiers, visit:\n"
-                    "  https://docs.anthropic.com/claude/reference/rate-limits \n"
-                ),
-            )
+            self._log_rate_limit_error()
             raise
 
         t_end = time.time()
@@ -175,12 +268,15 @@ class AnthropicAISchematicGenerator(BaseSchematicGenerator[T]):
         try:
             model_content = self.schema.model_validate(json_object)
 
+            cached_input_tokens: int = getattr(response.usage, "cache_read_input_tokens", None) or 0
+
             await record_llm_metrics(
                 self.meter,
                 self.model_name,
                 schema_name=self.schema.__name__,
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
+                cached_input_tokens=cached_input_tokens,
             )
 
             return SchematicGenerationResult(
@@ -192,6 +288,7 @@ class AnthropicAISchematicGenerator(BaseSchematicGenerator[T]):
                     usage=UsageInfo(
                         input_tokens=response.usage.input_tokens,
                         output_tokens=response.usage.output_tokens,
+                        extra={"cached_input_tokens": cached_input_tokens},
                     ),
                 ),
             )
@@ -201,8 +298,26 @@ class AnthropicAISchematicGenerator(BaseSchematicGenerator[T]):
             )
             raise
 
+    def _log_rate_limit_error(self) -> None:
+        self.logger.error(
+            (
+                "Anthropic API rate limit exceeded. Possible reasons:\n"
+                "1. Your account may have insufficient API credits.\n"
+                "2. You may be using a free-tier account with limited request capacity.\n"
+                "3. You might have exceeded the requests-per-minute limit for your account.\n\n"
+                "Recommended actions:\n"
+                "- Check your Anthropic account balance and billing status.\n"
+                "- Review your API usage limits in Anthropic's dashboard.\n"
+                "- For more details on rate limits and usage tiers, visit:\n"
+                "  https://docs.anthropic.com/claude/reference/rate-limits \n"
+            ),
+        )
+
 
 class Claude_Sonnet_3_5(AnthropicAISchematicGenerator[T]):
+    # claude-3-5-sonnet documented output limit: 8192 tokens
+    output_max_tokens = 8192
+
     def __init__(self, logger: Logger, tracer: Tracer, meter: Meter) -> None:
         super().__init__(
             model_name="claude-3-5-sonnet-20241022",
@@ -218,6 +333,9 @@ class Claude_Sonnet_3_5(AnthropicAISchematicGenerator[T]):
 
 
 class Claude_Sonnet_4(AnthropicAISchematicGenerator[T]):
+    # claude-sonnet-4 documented output limit: 64k (conservative: 32000)
+    output_max_tokens = 32000
+
     def __init__(self, logger: Logger, tracer: Tracer, meter: Meter) -> None:
         super().__init__(
             model_name="claude-sonnet-4-20250514",
@@ -233,6 +351,9 @@ class Claude_Sonnet_4(AnthropicAISchematicGenerator[T]):
 
 
 class Claude_Opus_4_1(AnthropicAISchematicGenerator[T]):
+    # claude-opus-4-1 documented output limit: 32k (conservative: 32000)
+    output_max_tokens = 32000
+
     def __init__(self, logger: Logger, tracer: Tracer, meter: Meter) -> None:
         super().__init__(
             model_name="claude-opus-4-1-20250805",
