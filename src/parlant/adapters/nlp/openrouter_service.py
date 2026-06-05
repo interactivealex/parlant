@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from __future__ import annotations
+from functools import cached_property
 import time
 from openai import (
     APIConnectionError,
@@ -168,6 +169,11 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
         # Default implementation - should be overridden by subclasses
         return 8192
 
+    @cached_property
+    def _schema_json(self) -> dict[str, Any]:
+        """The JSON Schema of the target schema, computed once per instance."""
+        return self.schema.model_json_schema()
+
     @policy(
         [
             retry(
@@ -202,6 +208,9 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
             for marker in (
                 "json_schema",
                 "json schema",
+                # "json mode" deliberately overlaps with _is_json_mode_rejection:
+                # a JSON-mode rejection while in json_schema mode demotes to
+                # json_object first, and only then (if it fails again) to plain.
                 "json mode",
                 "structured output",
                 "structured_outputs",
@@ -242,7 +251,7 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
                             "json_schema": {
                                 "name": self.schema.__name__,
                                 "strict": True,
-                                "schema": self.schema.model_json_schema(),
+                                "schema": self._schema_json,
                             },
                         },
                         extra_body={"provider": {"require_parameters": True}},
@@ -682,17 +691,22 @@ Please set OPENROUTER_API_KEY in your environment before running Parlant.
         if max_tokens_str:
             max_tokens = int(max_tokens_str)
         else:
-            # Provide sensible context-window defaults based on model family
-            if "gpt-4" in model_name:
-                max_tokens = 128 * 1024
-            elif "claude" in model_name:
-                max_tokens = 200 * 1024
-            elif "llama-3" in model_name:
-                max_tokens = 128 * 1024
-            elif "llama" in model_name or "gemma" in model_name:
-                max_tokens = 8192
-            else:
-                max_tokens = 8192  # Safe default for unknown models
+            # Ordered (first match wins) context-window defaults by model family.
+            family_context_windows = (
+                ("gpt-4", 128 * 1024),
+                ("claude", 200 * 1024),
+                ("llama-3", 128 * 1024),  # must precede the generic "llama" entry
+                ("llama", 8192),
+                ("gemma", 8192),
+            )
+            max_tokens = next(
+                (
+                    context_window
+                    for family, context_window in family_context_windows
+                    if family in model_name
+                ),
+                8192,  # Safe default for unknown models
+            )
 
         # Create dynamic generator class with the specific max_tokens
         final_max_tokens = max_tokens

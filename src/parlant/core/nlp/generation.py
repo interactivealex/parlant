@@ -18,6 +18,7 @@ from functools import cached_property
 import json
 from typing import Any, AsyncIterator, Callable, Generic, Mapping, TypeVar, cast, get_args
 from typing_extensions import override
+import weakref
 
 from pydantic import ValidationError
 
@@ -31,6 +32,30 @@ from parlant.core.nlp.tokenization import EstimatingTokenizer
 from parlant.core.tracer import Tracer
 
 T = TypeVar("T", bound=DefaultBaseModel)
+
+
+# Per-meter histogram cache. Weak keys let short-lived meters (e.g. in tests) be
+# garbage-collected together with their histograms (mirroring record_llm_metrics
+# in adapters/nlp/common.py).
+_DURATION_HISTOGRAMS: weakref.WeakKeyDictionary[Meter, dict[str, DurationHistogram]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _get_or_create_duration_histogram(
+    meter: Meter,
+    name: str,
+    description: str,
+) -> DurationHistogram:
+    """Return the named duration histogram for *meter*, creating it on first call."""
+    histograms = _DURATION_HISTOGRAMS.setdefault(meter, {})
+
+    histogram = histograms.get(name)
+    if histogram is None:
+        histogram = meter.create_duration_histogram(name=name, description=description)
+        histograms[name] = histogram
+
+    return histogram
 
 
 # ============================================================================
@@ -101,9 +126,6 @@ class StreamingTextGenerator(ABC):
         ...
 
 
-_STREAMING_REQUEST_DURATION_HISTOGRAM: DurationHistogram | None = None
-
-
 class BaseStreamingTextGenerator(StreamingTextGenerator):
     """Base class for streaming text generators with tracing and metrics."""
 
@@ -113,12 +135,11 @@ class BaseStreamingTextGenerator(StreamingTextGenerator):
         self.meter = meter
         self.model_name = model_name
 
-        global _STREAMING_REQUEST_DURATION_HISTOGRAM
-        if _STREAMING_REQUEST_DURATION_HISTOGRAM is None:
-            _STREAMING_REQUEST_DURATION_HISTOGRAM = meter.create_duration_histogram(
-                name="stream",
-                description="Duration of streaming generation requests in milliseconds",
-            )
+        self._request_duration_histogram = _get_or_create_duration_histogram(
+            meter,
+            name="stream",
+            description="Duration of streaming generation requests in milliseconds",
+        )
 
     @abstractmethod
     async def do_generate(
@@ -141,8 +162,6 @@ class BaseStreamingTextGenerator(StreamingTextGenerator):
         prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
     ) -> StreamingTextGenerationResult:
-        assert _STREAMING_REQUEST_DURATION_HISTOGRAM is not None
-
         start = Stopwatch.start()
         stream_complete = False
         duration: float = 0.0
@@ -254,9 +273,6 @@ class SchematicGenerator(ABC, Generic[T]):
         ...
 
 
-_REQUEST_DURATION_HISTOGRAM: DurationHistogram | None = None
-
-
 class BaseSchematicGenerator(SchematicGenerator[T]):
     # Number of retries after a schema-validation failure (so N+1 attempts total).
     # Override as a class attribute in subclasses; do not mutate on instances.
@@ -268,12 +284,11 @@ class BaseSchematicGenerator(SchematicGenerator[T]):
         self.meter = meter
         self.model_name = model_name
 
-        global _REQUEST_DURATION_HISTOGRAM
-        if _REQUEST_DURATION_HISTOGRAM is None:
-            _REQUEST_DURATION_HISTOGRAM = meter.create_duration_histogram(
-                name="gen",
-                description="Duration of generation requests in milliseconds",
-            )
+        self._request_duration_histogram = _get_or_create_duration_histogram(
+            meter,
+            name="gen",
+            description="Duration of generation requests in milliseconds",
+        )
 
     @abstractmethod
     async def do_generate(
@@ -296,9 +311,7 @@ class BaseSchematicGenerator(SchematicGenerator[T]):
         When wrapped in a FallbackSchematicGenerator, the next generator is
         only tried after these retries are exhausted.
         """
-        assert _REQUEST_DURATION_HISTOGRAM is not None
-
-        async with _REQUEST_DURATION_HISTOGRAM.measure(
+        async with self._request_duration_histogram.measure(
             {
                 "class.name": self.__class__.__qualname__,
                 "model.name": self.model_name,
@@ -336,9 +349,10 @@ class BaseSchematicGenerator(SchematicGenerator[T]):
                         # Out of attempts — re-raise below.
                         break
 
-                    if attempt == self.schema_validation_retries - 1:
-                        # Prepare the final attempt: augment the prompt with the
-                        # validation error. Earlier retries reuse the prompt unchanged.
+                    if attempt + 1 == self.schema_validation_retries:
+                        # The next attempt is the final one: augment the prompt with
+                        # the validation error. Earlier retries reuse the prompt
+                        # unchanged.
                         base_prompt = (
                             prompt.build() if isinstance(prompt, PromptBuilder) else prompt
                         )
