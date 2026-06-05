@@ -22,8 +22,10 @@ from openai import (
     BadRequestError,
     ConflictError,
     InternalServerError,
+    NotFoundError,
     RateLimitError,
 )
+from openai.types.chat import ChatCompletion
 from typing import Any, Callable, Mapping
 from typing_extensions import override
 import json
@@ -113,6 +115,38 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
 
         self._tokenizer = OpenRouterEstimatingTokenizer(model_name=self.model_name)
 
+        # Whether to transmit the schema (json_schema + strict); flipped off
+        # permanently for this instance if no provider/endpoint accepts it.
+        self._strict_incompatible = False
+        self._strict_schema: dict[str, Any] | None = None
+
+    def _get_strict_schema(self) -> dict[str, Any]:
+        if self._strict_schema is None:
+            self._strict_schema = self.schema.model_json_schema()
+        return self._strict_schema
+
+    def _is_schema_rejection(self, exc: BadRequestError | NotFoundError) -> bool:
+        """Return True when the error means the schema/parameters were rejected
+        (rather than some unrelated request problem)."""
+        msg = str(exc).lower()
+        if isinstance(exc, NotFoundError):
+            # OpenRouter returns 404 when provider.require_parameters filters
+            # out every endpoint for this model.
+            return "endpoints" in msg
+        return getattr(exc, "param", None) == "response_format" or any(
+            kw in msg for kw in ("response_format", "json_schema", "structured output")
+        )
+
+    def _log_rate_limit_error(self) -> None:
+        self._logger.error(
+            f"\nRate limit exceeded for model '{self.model_name}'.\n"
+            f"{RATE_LIMIT_ERROR_MESSAGE}\n"
+            f"Consider:\n"
+            f"  - Using a different model\n"
+            f"  - Waiting a moment before retrying\n"
+            f"  - Adding your own API key for higher limits\n"
+        )
+
     @property
     @override
     def id(self) -> str:
@@ -158,66 +192,43 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
 
         t_start = time.time()
 
-        # Try with JSON mode first, but catch errors gracefully
-        response = None
+        response: ChatCompletion | None = None
 
-        try:
-            # Try with JSON mode
-            response = await self._client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model=self.model_name,
-                response_format={"type": "json_object"},
-                **openrouter_api_arguments,
-            )
-        except BadRequestError as e:
-            # Check if it's a JSON mode error
-            error_str = str(e)
-            if "JSON mode" in error_str or "json_object" in error_str.lower():
-                self._logger.error(
-                    f"\nModel '{self.model_name}' does not support JSON mode.\n"
-                    f"Please switch to a model that supports JSON mode (e.g., 'openai/gpt-4o', 'anthropic/claude-3.5-sonnet').\n"
-                    f"Attempting to continue without JSON mode enforcement, but results may be less reliable.\n"
+        # Default: transmit the schema (json_schema + strict) so capable backends
+        # (OpenAI, Gemini, Claude, ...) enforce it with constrained decoding.
+        # provider.require_parameters routes only to endpoints honoring it.
+        # Opt-out: hints={"strict": False}.
+        if hints.get("strict", True) and not self._strict_incompatible:
+            try:
+                response = await self._client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=self.model_name,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": self.schema.__name__,
+                            "strict": True,
+                            "schema": self._get_strict_schema(),
+                        },
+                    },
+                    extra_body={"provider": {"require_parameters": True}},
+                    **openrouter_api_arguments,
                 )
-                # Retry without JSON mode with a system message to instruct JSON output
-                try:
-                    # Add system message to instruct the model to output JSON
-                    json_instruction = "IMPORTANT: You must respond with ONLY valid JSON. No explanatory text before or after the JSON. The response must be a valid JSON object."
-                    response = await self._client.chat.completions.create(
-                        messages=[
-                            {"role": "system", "content": json_instruction},
-                            {"role": "user", "content": prompt},
-                        ],
-                        model=self.model_name,
-                        **openrouter_api_arguments,
-                    )
-                except Exception as retry_error:
-                    self._logger.error(
-                        f"\nFailed to use model '{self.model_name}' even without JSON mode.\n"
-                        f"Error: {retry_error}\n"
-                        f"Please change your model to one that supports JSON mode or use a different model entirely.\n"
-                    )
+            except (BadRequestError, NotFoundError) as e:
+                if not self._is_schema_rejection(e):
                     raise
-            else:
-                # Some other BadRequest error - just log it once and raise
-                self._logger.error(f"OpenRouter API BadRequest: {e}")
+                self._logger.warning(
+                    f"Schema-enforced output not available for '{self.model_name}' "
+                    f"({type(e).__name__}: {e}). Falling back to json_object mode "
+                    "for this instance."
+                )
+                self._strict_incompatible = True
+            except RateLimitError:
+                self._log_rate_limit_error()
                 raise
-        except RateLimitError:
-            self._logger.error(
-                f"\nRate limit exceeded for model '{self.model_name}'.\n"
-                f"{RATE_LIMIT_ERROR_MESSAGE}\n"
-                f"Consider:\n"
-                f"  - Using a different model\n"
-                f"  - Waiting a moment before retrying\n"
-                f"  - Adding your own API key for higher limits\n"
-            )
-            raise
-        except Exception as e:
-            self._logger.error(
-                f"\nOpenRouter API error with model '{self.model_name}': {type(e).__name__}\n"
-                f"{e}\n"
-                f"Consider switching to a more compatible model.\n"
-            )
-            raise
+
+        if response is None:
+            response = await self._request_json_object(prompt, openrouter_api_arguments)
 
         t_end = time.time()
 
@@ -314,6 +325,65 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
                 f"Validation errors: {str(e)}\n"
                 f"This model may not be producing valid structured output.\n"
                 f"Consider switching to a model that supports JSON mode.\n"
+            )
+            raise
+
+    async def _request_json_object(
+        self,
+        prompt: str,
+        openrouter_api_arguments: Mapping[str, Any],
+    ) -> ChatCompletion:
+        """Legacy json_object request, degrading to a plain JSON instruction for
+        models without JSON-mode support."""
+        try:
+            response: ChatCompletion = await self._client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model_name,
+                response_format={"type": "json_object"},
+                **openrouter_api_arguments,
+            )
+            return response
+        except BadRequestError as e:
+            # Check if it's a JSON mode error
+            error_str = str(e)
+            if "JSON mode" in error_str or "json_object" in error_str.lower():
+                self._logger.error(
+                    f"\nModel '{self.model_name}' does not support JSON mode.\n"
+                    f"Please switch to a model that supports JSON mode (e.g., 'openai/gpt-4o', 'anthropic/claude-3.5-sonnet').\n"
+                    f"Attempting to continue without JSON mode enforcement, but results may be less reliable.\n"
+                )
+                # Retry without JSON mode with a system message to instruct JSON output
+                try:
+                    # Add system message to instruct the model to output JSON
+                    json_instruction = "IMPORTANT: You must respond with ONLY valid JSON. No explanatory text before or after the JSON. The response must be a valid JSON object."
+                    plain_response: ChatCompletion = await self._client.chat.completions.create(
+                        messages=[
+                            {"role": "system", "content": json_instruction},
+                            {"role": "user", "content": prompt},
+                        ],
+                        model=self.model_name,
+                        **openrouter_api_arguments,
+                    )
+                    return plain_response
+                except Exception as retry_error:
+                    self._logger.error(
+                        f"\nFailed to use model '{self.model_name}' even without JSON mode.\n"
+                        f"Error: {retry_error}\n"
+                        f"Please change your model to one that supports JSON mode or use a different model entirely.\n"
+                    )
+                    raise
+            else:
+                # Some other BadRequest error - just log it once and raise
+                self._logger.error(f"OpenRouter API BadRequest: {e}")
+                raise
+        except RateLimitError:
+            self._log_rate_limit_error()
+            raise
+        except Exception as e:
+            self._logger.error(
+                f"\nOpenRouter API error with model '{self.model_name}': {type(e).__name__}\n"
+                f"{e}\n"
+                f"Consider switching to a more compatible model.\n"
             )
             raise
 

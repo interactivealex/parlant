@@ -18,6 +18,8 @@ from lagom import Container
 import pytest
 from unittest.mock import AsyncMock, patch, Mock
 import asyncio
+import httpx
+from openai import BadRequestError, NotFoundError
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
 from openai.types.completion_usage import CompletionUsage
@@ -561,3 +563,151 @@ def test_that_openrouter_generator_supports_correct_parameters(container: Contai
 
     expected_params = ["temperature", "max_tokens"]
     assert generator.supported_openrouter_params == expected_params
+
+
+def _make_mock_response(content: str = '{"test_field": "hello"}') -> Mock:
+    mock_response = Mock(spec=ChatCompletion)
+    mock_response.choices = [
+        Choice(
+            message=ChatCompletionMessage(role="assistant", content=content),
+            finish_reason="stop",
+            index=0,
+        )
+    ]
+    mock_response.usage = CompletionUsage(prompt_tokens=15, completion_tokens=7, total_tokens=22)
+    return mock_response
+
+
+def _make_generator(
+    mock_client: AsyncMock, meter: Meter
+) -> "OpenRouterSchematicGenerator[SchemaData]":
+    from parlant.core.loggers import StdoutLogger
+    from parlant.core.tracer import LocalTracer
+
+    tracer = LocalTracer()
+    logger = StdoutLogger(tracer)
+    return OpenRouterSchematicGenerator[SchemaData](
+        model_name="google/gemini-2.5-pro",
+        logger=logger,
+        tracer=tracer,
+        meter=meter,
+    )
+
+
+def _bad_request_error(message: str) -> BadRequestError:
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    response = httpx.Response(400, request=request, json={"error": {"message": message}})
+    return BadRequestError(message, response=response, body={"error": {"message": message}})
+
+
+def _not_found_error(message: str) -> NotFoundError:
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    response = httpx.Response(404, request=request, json={"error": {"message": message}})
+    return NotFoundError(message, response=response, body={"error": {"message": message}})
+
+
+async def test_that_openrouter_generator_sends_json_schema_response_format_by_default() -> None:
+    """The Pydantic schema must be transmitted to the API (json_schema + strict),
+    with provider.require_parameters routing, so the backend enforces it."""
+    meter = RecordingMeter()
+
+    with (
+        patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class,
+        patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False),
+    ):
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=_make_mock_response())
+        mock_client_class.return_value = mock_client
+
+        generator = _make_generator(mock_client, meter)
+        result = await generator.do_generate("test prompt", hints={"max_tokens": 555})
+
+    assert result.content.test_field == "hello"
+
+    kwargs = mock_client.chat.completions.create.call_args.kwargs
+    response_format = kwargs["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["name"] == "SchemaData"
+    assert response_format["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["schema"] == SchemaData.model_json_schema()
+    assert kwargs["extra_body"] == {"provider": {"require_parameters": True}}
+    assert kwargs["max_tokens"] == 555
+
+
+async def test_that_openrouter_generator_uses_json_object_when_strict_hint_is_false() -> None:
+    """hints={"strict": False} opts out of schema enforcement (legacy json_object)."""
+    meter = RecordingMeter()
+
+    with (
+        patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class,
+        patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False),
+    ):
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=_make_mock_response())
+        mock_client_class.return_value = mock_client
+
+        generator = _make_generator(mock_client, meter)
+        await generator.do_generate("test prompt", hints={"strict": False})
+
+    kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert kwargs["response_format"] == {"type": "json_object"}
+    assert "extra_body" not in kwargs
+
+
+async def test_that_openrouter_generator_falls_back_to_json_object_when_schema_rejected() -> None:
+    """A 400 referencing json_schema/response_format must fall back to json_object
+    for this call AND permanently for the instance (no repeated failed attempts)."""
+    meter = RecordingMeter()
+
+    with (
+        patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class,
+        patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False),
+    ):
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(
+            side_effect=[
+                _bad_request_error("Provider returned error: json_schema is not supported"),
+                _make_mock_response(),
+                _make_mock_response(),
+            ]
+        )
+        mock_client_class.return_value = mock_client
+
+        generator = _make_generator(mock_client, meter)
+        result = await generator.do_generate("test prompt")
+        assert result.content.test_field == "hello"
+
+        # Second generation goes straight to json_object — no new json_schema attempt.
+        await generator.do_generate("test prompt")
+
+    calls = mock_client.chat.completions.create.call_args_list
+    assert calls[0].kwargs["response_format"]["type"] == "json_schema"
+    assert calls[1].kwargs["response_format"] == {"type": "json_object"}
+    assert calls[2].kwargs["response_format"] == {"type": "json_object"}
+
+
+async def test_that_openrouter_generator_falls_back_when_no_endpoint_supports_parameters() -> None:
+    """OpenRouter returns 404 'No endpoints found' when require_parameters filters out
+    every provider — that must also fall back to json_object, not crash."""
+    meter = RecordingMeter()
+
+    with (
+        patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class,
+        patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False),
+    ):
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(
+            side_effect=[
+                _not_found_error("No endpoints found that support the requested parameters"),
+                _make_mock_response(),
+            ]
+        )
+        mock_client_class.return_value = mock_client
+
+        generator = _make_generator(mock_client, meter)
+        result = await generator.do_generate("test prompt")
+
+    assert result.content.test_field == "hello"
+    calls = mock_client.chat.completions.create.call_args_list
+    assert calls[0].kwargs["response_format"]["type"] == "json_schema"
+    assert calls[1].kwargs["response_format"] == {"type": "json_object"}
