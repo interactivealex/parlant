@@ -260,6 +260,43 @@ def test_that_openrouter_generator_sets_custom_headers(mock_client_class: Mock) 
 
 
 @patch("parlant.adapters.nlp.openrouter_service.AsyncClient")
+def test_that_openrouter_generator_uses_default_base_url(mock_client_class: Mock) -> None:
+    """Without OPENROUTER_BASE_URL, the client must talk to openrouter.ai."""
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=True):
+        _ = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=Mock(),
+            tracer=Mock(),
+            meter=Mock(),
+        )
+
+        assert mock_client_class.call_args.kwargs["base_url"] == "https://openrouter.ai/api/v1"
+
+
+@patch("parlant.adapters.nlp.openrouter_service.AsyncClient")
+def test_that_openrouter_generator_honors_custom_base_url(mock_client_class: Mock) -> None:
+    """OPENROUTER_BASE_URL redirects requests to an OpenRouter-compatible gateway."""
+    with patch.dict(
+        os.environ,
+        {
+            "OPENROUTER_API_KEY": "test-key",
+            "OPENROUTER_BASE_URL": "https://gateway.example.com/api/v1/",
+        },
+        clear=True,
+    ):
+        _ = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=Mock(),
+            tracer=Mock(),
+            meter=Mock(),
+        )
+
+        assert (
+            mock_client_class.call_args.kwargs["base_url"] == "https://gateway.example.com/api/v1/"
+        )
+
+
+@patch("parlant.adapters.nlp.openrouter_service.AsyncClient")
 def test_that_openrouter_generator_without_custom_headers(mock_client_class: Mock) -> None:
     """Test OpenRouter generator without custom headers."""
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=True):
@@ -489,15 +526,17 @@ async def test_that_openrouter_generator_sends_json_schema_response_format(
         await generator.do_generate("Generate structured output")
 
     call_kwargs = mock_client.chat.completions.create.call_args.kwargs
-    assert call_kwargs["response_format"] == {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "SchemaData",
-            "strict": True,
-            "schema": SchemaData.model_json_schema(),
-        },
-    }
+    assert call_kwargs["response_format"]["type"] == "json_schema"
+    assert call_kwargs["response_format"]["json_schema"]["name"] == "SchemaData"
+    assert call_kwargs["response_format"]["json_schema"]["strict"] is True
     assert call_kwargs["extra_body"] == {"provider": {"require_parameters": True}}
+
+    # The transmitted schema must be OpenAI-strict-compatible: object nodes carry
+    # additionalProperties=false and every property (even defaulted ones) is required.
+    sent_schema = call_kwargs["response_format"]["json_schema"]["schema"]
+    assert sent_schema["additionalProperties"] is False
+    assert sent_schema["required"] == ["test_field"]
+    assert set(sent_schema["properties"]) == {"test_field"}
 
 
 async def test_that_openrouter_generator_falls_back_to_json_object_when_json_schema_is_rejected(

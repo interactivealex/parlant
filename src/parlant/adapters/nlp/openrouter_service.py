@@ -83,7 +83,10 @@ class OpenRouterEmptyEmbeddingResponseError(Exception):
 
 def _create_openrouter_client() -> AsyncClient:
     """Create an OpenAI-compatible client for the OpenRouter API, including the
-    optional attribution headers OpenRouter supports."""
+    optional attribution headers OpenRouter supports.
+
+    OPENROUTER_BASE_URL redirects requests to an OpenRouter-compatible gateway
+    (e.g. a proxy that forwards to OpenRouter)."""
     extra_headers: dict[str, str] = {}
     if "OPENROUTER_HTTP_REFERER" in os.environ:
         extra_headers["HTTP-Referer"] = os.environ["OPENROUTER_HTTP_REFERER"]
@@ -91,7 +94,7 @@ def _create_openrouter_client() -> AsyncClient:
         extra_headers["X-Title"] = os.environ["OPENROUTER_SITE_NAME"]
 
     return AsyncClient(
-        base_url="https://openrouter.ai/api/v1",
+        base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         api_key=os.environ["OPENROUTER_API_KEY"],
         default_headers=extra_headers if extra_headers else None,
     )
@@ -171,8 +174,21 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
 
     @cached_property
     def _schema_json(self) -> dict[str, Any]:
-        """The JSON Schema of the target schema, computed once per instance."""
-        return self.schema.model_json_schema()
+        """The JSON Schema of the target schema, computed once per instance.
+
+        Strict structured-output providers (e.g. OpenAI) require object nodes to
+        carry additionalProperties=false and every property to be required, so the
+        schema is transformed with the OpenAI SDK's strict converter. When the
+        transformation is unavailable or rejects the schema, the raw Pydantic
+        schema is sent instead; providers that then refuse it trigger the
+        json_object fallback in _create_completion.
+        """
+        try:
+            from openai.lib._pydantic import to_strict_json_schema
+
+            return dict(to_strict_json_schema(self.schema))
+        except Exception:
+            return self.schema.model_json_schema()
 
     @policy(
         [
