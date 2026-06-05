@@ -13,12 +13,13 @@
 # limitations under the License.
 
 import asyncio
-from typing import Any, AsyncIterator, Callable, Mapping, cast
+from typing import Any, AsyncIterator, Callable, Mapping, TypeVar, cast
 from typing_extensions import override
 from lagom import Container
 from unittest.mock import AsyncMock
 
 from pytest import raises
+from pydantic import ValidationError
 
 from parlant.core.common import DefaultBaseModel
 from parlant.core.engines.alpha.prompt_builder import (
@@ -31,6 +32,7 @@ from parlant.core.loggers import Logger
 from parlant.core.meter import Meter
 from parlant.core.nlp.embedding import EmbeddingResult
 from parlant.core.nlp.generation import (
+    BaseSchematicGenerator,
     BaseStreamingTextGenerator,
     FallbackSchematicGenerator,
     SchematicGenerationResult,
@@ -572,3 +574,174 @@ async def test_that_base_streaming_text_generator_propagates_exceptions(
     with raises(Exception, match="Generation failed mid-stream"):
         async for _ in result.stream:
             pass
+
+
+# ============================================================================
+# BaseSchematicGenerator retry-on-validation-error tests
+# ============================================================================
+
+
+class _StrictSchema(DefaultBaseModel):
+    """Tiny schema used to construct real pydantic ValidationErrors."""
+
+    value: int
+
+
+def _make_validation_error() -> ValidationError:
+    try:
+        _StrictSchema.model_validate({})
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("Expected ValidationError was not raised")  # pragma: no cover
+
+
+def _make_success_result() -> SchematicGenerationResult[DummySchema]:
+    return SchematicGenerationResult(
+        content=DummySchema(result="ok"),
+        info=GenerationInfo(
+            schema_name="DummySchema",
+            model="test-model",
+            duration=0.0,
+            usage=UsageInfo(input_tokens=1, output_tokens=1),
+        ),
+    )
+
+
+_S = TypeVar("_S", bound=DefaultBaseModel)
+
+
+class _ConcreteSchematicGenerator(BaseSchematicGenerator[_S]):
+    """Minimal concrete generic subclass of BaseSchematicGenerator for unit testing."""
+
+    def __init__(
+        self,
+        logger: Logger,
+        tracer: Tracer,
+        meter: Meter,
+        do_generate_mock: AsyncMock,
+    ) -> None:
+        super().__init__(logger=logger, tracer=tracer, meter=meter, model_name="test-model")
+        self._do_generate_mock = do_generate_mock
+
+    @override
+    async def do_generate(
+        self,
+        prompt: str | PromptBuilder,
+        hints: Mapping[str, Any] = {},
+    ) -> SchematicGenerationResult[_S]:
+        return await self._do_generate_mock(prompt=prompt, hints=hints)  # type: ignore[no-any-return]
+
+    @property
+    @override
+    def id(self) -> str:
+        return "test-concrete-generator"
+
+    @property
+    @override
+    def max_tokens(self) -> int:
+        return 4096
+
+    @property
+    @override
+    def tokenizer(self) -> EstimatingTokenizer:
+        return ZeroEstimatingTokenizer()
+
+
+def _make_generator(
+    container: Container,
+    mock: AsyncMock,
+) -> "_ConcreteSchematicGenerator[DummySchema]":
+    """Create a _ConcreteSchematicGenerator with __orig_class__ set so that
+    the cached_property ``schema`` resolves to DummySchema."""
+    gen: _ConcreteSchematicGenerator[DummySchema] = _ConcreteSchematicGenerator(
+        logger=container[Logger],
+        tracer=container[Tracer],
+        meter=container[Meter],
+        do_generate_mock=mock,
+    )
+    # SchematicGenerator.schema uses __orig_class__ to derive the TypeVar binding;
+    # set it manually to simulate `_ConcreteSchematicGenerator[DummySchema](...)`.
+    gen.__orig_class__ = _ConcreteSchematicGenerator[DummySchema]  # type: ignore[attr-defined]
+    return gen
+
+
+async def test_that_schematic_generation_retries_on_validation_error_and_succeeds(
+    container: Container,
+) -> None:
+    """Fail once with ValidationError; succeed on the second attempt.
+
+    Expects:
+    - The result equals the success value.
+    - do_generate is called exactly twice.
+    """
+    validation_error = _make_validation_error()
+    success = _make_success_result()
+
+    mock = AsyncMock(side_effect=[validation_error, success])
+    generator = _make_generator(container, mock)
+
+    result = await generator.generate(prompt="test prompt")
+
+    assert result.content.result == "ok"
+    assert mock.await_count == 2
+
+
+async def test_that_schematic_generation_appends_corrective_note_on_second_retry(
+    container: Container,
+) -> None:
+    """Fail twice; on the third attempt the prompt must contain the error text."""
+    validation_error = _make_validation_error()
+    success = _make_success_result()
+
+    captured_prompts: list[str | PromptBuilder] = []
+
+    async def _side_effect(
+        prompt: str | PromptBuilder, hints: Mapping[str, Any]
+    ) -> SchematicGenerationResult[DummySchema]:
+        captured_prompts.append(prompt)
+        if len(captured_prompts) < 3:
+            raise validation_error
+        return success
+
+    mock = AsyncMock(side_effect=_side_effect)
+    generator = _make_generator(container, mock)
+
+    result = await generator.generate(prompt="original prompt")
+
+    assert result.content.result == "ok"
+    assert mock.await_count == 3
+
+    third_prompt = captured_prompts[2]
+    assert isinstance(third_prompt, str)
+    assert "original prompt" in third_prompt
+    # The corrective note must contain some portion of the error message
+    error_fragment = str(validation_error)[:50]
+    assert error_fragment in third_prompt
+
+
+async def test_that_schematic_generation_raises_after_exhausting_retries(
+    container: Container,
+) -> None:
+    """Always fail; assert ValidationError propagates and call count == 3."""
+    validation_error = _make_validation_error()
+
+    mock = AsyncMock(side_effect=validation_error)
+    generator = _make_generator(container, mock)
+
+    with raises(ValidationError):
+        await generator.generate(prompt="test prompt")
+
+    assert mock.await_count == 3
+
+
+async def test_that_non_schema_errors_are_not_retried(
+    container: Container,
+) -> None:
+    """do_generate raises ValueError; assert a single call and no retry."""
+    mock = AsyncMock(side_effect=ValueError("some adapter error"))
+    generator = _make_generator(container, mock)
+
+    with raises(ValueError, match="some adapter error"):
+        await generator.generate(prompt="test prompt")
+
+    assert mock.await_count == 1

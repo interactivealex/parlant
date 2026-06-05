@@ -13,14 +13,16 @@
 # limitations under the License.
 
 from collections.abc import Generator
+import json
 import os
 from lagom import Container
 import pytest
-from unittest.mock import AsyncMock, patch, Mock
+from unittest.mock import AsyncMock, MagicMock, patch, Mock
 import asyncio
+from openai import BadRequestError, NotFoundError
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
-from openai.types.completion_usage import CompletionUsage
+from openai.types.completion_usage import CompletionUsage, PromptTokensDetails
 
 from parlant.adapters.nlp.openrouter_service import (  # type: ignore[reportMissingImports]
     OpenRouterService,
@@ -28,7 +30,7 @@ from parlant.adapters.nlp.openrouter_service import (  # type: ignore[reportMiss
     OpenRouterEmbedder,
     OpenRouterGPT4O,
     OpenRouterGPT4OMini,
-    OpenRouterClaude35Sonnet,
+    OpenRouterClaudeSonnet46,
     OpenRouterLlama33_70B,
     OpenRouterEstimatingTokenizer,
 )
@@ -37,11 +39,27 @@ from parlant.core.common import DefaultBaseModel
 from parlant.core.meter import Meter
 from parlant.core.tracer import Tracer
 
+from tests.test_utilities import RecordingMeter
+
 
 class SchemaData(DefaultBaseModel):
     """Test schema for type checking."""
 
     test_field: str = "test_value"
+
+
+def _make_chat_response(content: str, usage: CompletionUsage | Mock | None) -> Mock:
+    """Build a mocked ChatCompletion response with the given content and usage."""
+    mock_response = Mock(spec=ChatCompletion)
+    mock_response.choices = [
+        Choice(
+            message=ChatCompletionMessage(role="assistant", content=content),
+            finish_reason="stop",
+            index=0,
+        )
+    ]
+    mock_response.usage = usage
+    return mock_response
 
 
 @pytest.fixture(autouse=True)
@@ -143,8 +161,8 @@ def test_that_openrouter_gpt4o_generator_initializes_correctly(container: Contai
     generator = OpenRouterGPT4O[SchemaData](
         logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
     )
-    assert generator.model_name == "openai/gpt-4o"
-    assert generator.id == "openrouter/openai/gpt-4o"
+    assert generator.model_name == "openai/gpt-4o-2024-11-20"
+    assert generator.id == "openrouter/openai/gpt-4o-2024-11-20"
     assert generator.max_tokens == 128 * 1024
 
 
@@ -153,17 +171,19 @@ def test_that_openrouter_gpt4o_mini_generator_initializes_correctly(container: C
     generator = OpenRouterGPT4OMini[SchemaData](
         logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
     )
-    assert generator.model_name == "openai/gpt-4o-mini"
+    assert generator.model_name == "openai/gpt-4o-mini-2024-07-18"
     assert generator.max_tokens == 128 * 1024
 
 
-def test_that_openrouter_claude_generator_initializes_correctly(container: Container) -> None:
-    """Test OpenRouterClaude35Sonnet initialization."""
-    generator = OpenRouterClaude35Sonnet[SchemaData](
+def test_that_openrouter_claude_sonnet_generator_initializes_correctly(
+    container: Container,
+) -> None:
+    """Test OpenRouterClaudeSonnet46 initialization."""
+    generator = OpenRouterClaudeSonnet46[SchemaData](
         logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
     )
-    assert generator.model_name == "anthropic/claude-3.5-sonnet"
-    assert generator.max_tokens == 8192
+    assert generator.model_name == "anthropic/claude-sonnet-4.6"
+    assert generator.max_tokens == 1_000_000
 
 
 def test_that_openrouter_llama_generator_initializes_correctly(container: Container) -> None:
@@ -172,7 +192,7 @@ def test_that_openrouter_llama_generator_initializes_correctly(container: Contai
         logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
     )
     assert generator.model_name == "meta-llama/llama-3.3-70b-instruct"
-    assert generator.max_tokens == 8192
+    assert generator.max_tokens == 128 * 1024
 
 
 @patch("parlant.adapters.nlp.openrouter_service.AsyncClient")
@@ -240,7 +260,8 @@ async def test_that_openrouter_generator_handles_json_mode_error(mock_client_cla
         response=Mock(),
     )
 
-    mock_logger = Mock()
+    # MagicMock so that logger.scope() can be used as a context manager
+    mock_logger = MagicMock()
     mock_tracer = Mock()
     mock_meter = Mock()
 
@@ -290,6 +311,458 @@ async def test_that_openrouter_generator_handles_successful_response(
         assert result.info.usage.output_tokens == 20
 
 
+async def test_that_openrouter_generator_records_metrics_on_successful_generation(
+    container: Container,
+) -> None:
+    """record_llm_metrics must be called with correct token counts and schema_name."""
+    meter = RecordingMeter()
+
+    mock_response = _make_chat_response(
+        '{"test_field": "hello"}',
+        CompletionUsage(prompt_tokens=15, completion_tokens=7, total_tokens=22),
+    )
+
+    with patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=meter,
+        )
+
+        result = await generator.do_generate('{"test_field": "hello"}')
+
+    assert result.content.test_field == "hello"
+
+    # Counters must exist on the recording meter (not some other meter)
+    assert "input_tokens" in meter.counters
+    assert "output_tokens" in meter.counters
+    assert "cached_input_tokens" in meter.counters
+
+    input_call = meter.counters["input_tokens"].calls[0]
+    assert input_call[0] == 15
+    assert input_call[1] is not None
+    assert input_call[1]["schema_name"] == "SchemaData"
+    assert input_call[1]["model_name"] == "openai/gpt-4o"
+
+    output_call = meter.counters["output_tokens"].calls[0]
+    assert output_call[0] == 7
+
+
+async def test_that_openrouter_generator_records_zero_cached_tokens_when_absent(
+    container: Container,
+) -> None:
+    """When the API response has no cached-token information, cached_input_tokens is 0."""
+    meter = RecordingMeter()
+
+    # CompletionUsage has neither prompt_tokens_details nor prompt_cache_hit_tokens
+    mock_response = _make_chat_response(
+        '{"test_field": "world"}',
+        CompletionUsage(prompt_tokens=5, completion_tokens=3, total_tokens=8),
+    )
+
+    with patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=meter,
+        )
+
+        await generator.do_generate('{"test_field": "world"}')
+
+    cached_call = meter.counters["cached_input_tokens"].calls[0]
+    assert cached_call[0] == 0
+
+
+async def test_that_openrouter_generator_records_cached_tokens_from_prompt_tokens_details(
+    container: Container,
+) -> None:
+    """Cached tokens are read from the OpenAI-compatible usage.prompt_tokens_details field."""
+    meter = RecordingMeter()
+
+    mock_response = _make_chat_response(
+        '{"test_field": "cached"}',
+        CompletionUsage(
+            prompt_tokens=100,
+            completion_tokens=10,
+            total_tokens=110,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=42),
+        ),
+    )
+
+    with patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=meter,
+        )
+
+        result = await generator.do_generate('{"test_field": "cached"}')
+
+    assert meter.counters["cached_input_tokens"].calls[0][0] == 42
+    assert result.info.usage.extra is not None
+    assert result.info.usage.extra["cached_input_tokens"] == 42
+
+
+async def test_that_openrouter_generator_records_cached_tokens_from_legacy_field(
+    container: Container,
+) -> None:
+    """Cached tokens fall back to the DeepSeek-style prompt_cache_hit_tokens field."""
+    meter = RecordingMeter()
+
+    # The OpenAI SDK usage model allows extra fields, so providers like DeepSeek
+    # can attach prompt_cache_hit_tokens to the usage payload.
+    usage = CompletionUsage(
+        prompt_tokens=50,
+        completion_tokens=5,
+        total_tokens=55,
+        prompt_cache_hit_tokens=9,  # type: ignore[call-arg]
+    )
+    mock_response = _make_chat_response('{"test_field": "legacy"}', usage)
+
+    with patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="deepseek/deepseek-chat",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=meter,
+        )
+
+        result = await generator.do_generate('{"test_field": "legacy"}')
+
+    assert meter.counters["cached_input_tokens"].calls[0][0] == 9
+    assert result.info.usage.extra is not None
+    assert result.info.usage.extra["cached_input_tokens"] == 9
+
+
+async def test_that_openrouter_generator_handles_none_token_counts_in_usage(
+    container: Container,
+) -> None:
+    """Some OpenRouter providers return usage with None token counts; treat them as 0."""
+    meter = RecordingMeter()
+
+    usage = Mock(spec=CompletionUsage)
+    usage.prompt_tokens = None
+    usage.completion_tokens = None
+    usage.prompt_tokens_details = None
+    usage.model_dump_json.return_value = "{}"
+
+    mock_response = _make_chat_response('{"test_field": "none-usage"}', usage)
+
+    with patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=meter,
+        )
+
+        result = await generator.do_generate('{"test_field": "none-usage"}')
+
+    assert result.content.test_field == "none-usage"
+    assert result.info.usage.input_tokens == 0
+    assert result.info.usage.output_tokens == 0
+    assert meter.counters["input_tokens"].calls[0][0] == 0
+    assert meter.counters["output_tokens"].calls[0][0] == 0
+    assert meter.counters["cached_input_tokens"].calls[0][0] == 0
+
+
+async def test_that_openrouter_generator_handles_missing_usage_without_crashing(
+    container: Container,
+) -> None:
+    """A response without usage data must not crash; zero token counts are recorded."""
+    meter = RecordingMeter()
+
+    mock_response = _make_chat_response('{"test_field": "no-usage"}', None)
+
+    with patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=meter,
+        )
+
+        result = await generator.do_generate('{"test_field": "no-usage"}')
+
+    assert result.content.test_field == "no-usage"
+    assert result.info.usage.input_tokens == 0
+    assert result.info.usage.output_tokens == 0
+    assert meter.counters["input_tokens"].calls[0][0] == 0
+
+
+async def test_that_openrouter_generator_sends_json_schema_response_format(
+    container: Container,
+) -> None:
+    """The first request must transmit the Pydantic schema via json_schema response_format
+    and require providers that support it."""
+    mock_response = _make_chat_response(
+        '{"test_field": "structured"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=container[Meter],
+        )
+
+        await generator.do_generate("Generate structured output")
+
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "SchemaData",
+            "strict": True,
+            "schema": SchemaData.model_json_schema(),
+        },
+    }
+    assert call_kwargs["extra_body"] == {"provider": {"require_parameters": True}}
+
+
+async def test_that_openrouter_generator_falls_back_to_json_object_when_json_schema_is_rejected(
+    container: Container,
+) -> None:
+    """A json_schema rejection demotes the generator to json_object mode, which is memoized."""
+    mock_responses = [
+        _make_chat_response(
+            '{"test_field": "first"}',
+            CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        ),
+        _make_chat_response(
+            '{"test_field": "second"}',
+            CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        ),
+    ]
+
+    with patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(
+            side_effect=[
+                BadRequestError(
+                    "Provider returned error: json_schema response_format is not supported",
+                    response=Mock(),
+                    body=None,
+                ),
+                mock_responses[0],
+                mock_responses[1],
+            ]
+        )
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="some/model-without-structured-outputs",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=container[Meter],
+        )
+
+        first_result = await generator.do_generate("First request")
+        second_result = await generator.do_generate("Second request")
+
+    assert first_result.content.test_field == "first"
+    assert second_result.content.test_field == "second"
+
+    calls = mock_client.chat.completions.create.call_args_list
+    assert len(calls) == 3
+    assert calls[0].kwargs["response_format"]["type"] == "json_schema"
+    assert calls[1].kwargs["response_format"]["type"] == "json_object"
+    # The fallback is memoized: the second generation goes straight to json_object
+    assert calls[2].kwargs["response_format"]["type"] == "json_object"
+
+
+async def test_that_openrouter_generator_falls_back_when_no_endpoints_support_structured_outputs(
+    container: Container,
+) -> None:
+    """require_parameters can yield a 404 'no endpoints' error; fall back to json_object."""
+    mock_response = _make_chat_response(
+        '{"test_field": "fallback"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(
+            side_effect=[
+                NotFoundError(
+                    "No endpoints found that support the requested parameters",
+                    response=Mock(),
+                    body=None,
+                ),
+                mock_response,
+            ]
+        )
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="some/model",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=container[Meter],
+        )
+
+        result = await generator.do_generate("Fallback request")
+
+    assert result.content.test_field == "fallback"
+
+    calls = mock_client.chat.completions.create.call_args_list
+    assert calls[0].kwargs["response_format"]["type"] == "json_schema"
+    assert calls[1].kwargs["response_format"]["type"] == "json_object"
+
+
+async def test_that_openrouter_generator_forwards_completion_max_tokens_from_env(
+    container: Container,
+) -> None:
+    """OPENROUTER_COMPLETION_MAX_TOKENS is forwarded to the API as max_tokens."""
+    mock_response = _make_chat_response(
+        '{"test_field": "capped"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class,
+        patch.dict(os.environ, {"OPENROUTER_COMPLETION_MAX_TOKENS": "512"}, clear=False),
+    ):
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=container[Meter],
+        )
+
+        await generator.do_generate("Capped request")
+
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["max_tokens"] == 512
+
+
+async def test_that_openrouter_generator_forwards_max_tokens_hint_over_env(
+    container: Container,
+) -> None:
+    """A max_tokens hint takes precedence over OPENROUTER_COMPLETION_MAX_TOKENS."""
+    mock_response = _make_chat_response(
+        '{"test_field": "hinted"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class,
+        patch.dict(os.environ, {"OPENROUTER_COMPLETION_MAX_TOKENS": "512"}, clear=False),
+    ):
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=container[Meter],
+        )
+
+        await generator.do_generate("Hinted request", hints={"max_tokens": 256})
+
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["max_tokens"] == 256
+
+
+async def test_that_openrouter_generator_omits_max_tokens_when_not_configured(
+    container: Container,
+) -> None:
+    """Without a hint or env var, max_tokens is not sent (provider defaults apply)."""
+    mock_response = _make_chat_response(
+        '{"test_field": "uncapped"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    env_without_cap = {
+        k: v for k, v in os.environ.items() if k != "OPENROUTER_COMPLETION_MAX_TOKENS"
+    }
+
+    with (
+        patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class,
+        patch.dict(os.environ, env_without_cap, clear=True),
+    ):
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=container[Meter],
+        )
+
+        await generator.do_generate("Uncapped request")
+
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert "max_tokens" not in call_kwargs
+
+
+async def test_that_openrouter_generator_raises_json_decode_error_when_response_is_not_json(
+    container: Container,
+) -> None:
+    """Unparseable responses must raise (so the base generator can retry), not be
+    silently swallowed into an empty JSON object."""
+    mock_response = _make_chat_response(
+        "I'm sorry, I cannot help with that.",
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with patch("parlant.adapters.nlp.openrouter_service.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        generator = OpenRouterSchematicGenerator[SchemaData](
+            model_name="openai/gpt-4o",
+            logger=container[Logger],
+            tracer=container[Tracer],
+            meter=container[Meter],
+        )
+
+        with pytest.raises(json.JSONDecodeError):
+            await generator.do_generate("Some request")
+
+
 def test_that_openrouter_service_returns_correct_generator(container: Container) -> None:
     """Test OpenRouterService.get_schematic_generator with default model."""
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=True):
@@ -298,7 +771,7 @@ def test_that_openrouter_service_returns_correct_generator(container: Container)
         )
         generator = asyncio.run(service.get_schematic_generator(SchemaData))
         assert isinstance(generator, OpenRouterSchematicGenerator)
-        assert generator.model_name == "openai/gpt-4o"
+        assert generator.model_name == "openai/gpt-4o-2024-11-20"
 
 
 def test_that_openrouter_service_returns_correct_generator_for_claude(
@@ -309,7 +782,7 @@ def test_that_openrouter_service_returns_correct_generator_for_claude(
         os.environ,
         {
             "OPENROUTER_API_KEY": "test-key",
-            "OPENROUTER_MODEL": "anthropic/claude-3.5-sonnet",
+            "OPENROUTER_MODEL": "anthropic/claude-sonnet-4.6",
         },
         clear=True,
     ):
@@ -317,8 +790,8 @@ def test_that_openrouter_service_returns_correct_generator_for_claude(
             logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
         )
         generator = asyncio.run(service.get_schematic_generator(SchemaData))
-        assert isinstance(generator, OpenRouterClaude35Sonnet)
-        assert generator.model_name == "anthropic/claude-3.5-sonnet"
+        assert isinstance(generator, OpenRouterClaudeSonnet46)
+        assert generator.model_name == "anthropic/claude-sonnet-4.6"
 
 
 def test_that_openrouter_service_creates_dynamic_generator_for_unknown_model(
@@ -399,7 +872,7 @@ def test_that_openrouter_service_sets_default_max_tokens_for_claude(container: C
             logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
         )
         generator = asyncio.run(service.get_schematic_generator(SchemaData))
-        assert generator.max_tokens == 8192
+        assert generator.max_tokens == 200 * 1024
 
 
 def test_that_openrouter_service_sets_default_max_tokens_for_llama(container: Container) -> None:
@@ -414,6 +887,20 @@ def test_that_openrouter_service_sets_default_max_tokens_for_llama(container: Co
         )
         generator = asyncio.run(service.get_schematic_generator(SchemaData))
         assert generator.max_tokens == 8192
+
+
+def test_that_openrouter_service_sets_default_max_tokens_for_llama3(container: Container) -> None:
+    """Test OpenRouterService sets default max_tokens for Llama 3.x models."""
+    with patch.dict(
+        os.environ,
+        {"OPENROUTER_API_KEY": "test-key", "OPENROUTER_MODEL": "meta-llama/llama-3.1-8b-instruct"},
+        clear=True,
+    ):
+        service = OpenRouterService(
+            logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
+        )
+        generator = asyncio.run(service.get_schematic_generator(SchemaData))
+        assert generator.max_tokens == 128 * 1024
 
 
 @patch("parlant.core.nlp.policies.asyncio.sleep", new_callable=AsyncMock)
