@@ -97,6 +97,14 @@ def _openrouter_generator(
 
 
 @pytest.fixture(autouse=True)
+def reset_response_format_modes() -> Generator[None, None, None]:
+    """Isolate the process-wide response-format demotion cache between tests."""
+    OpenRouterSchematicGenerator._response_format_modes.clear()
+    yield
+    OpenRouterSchematicGenerator._response_format_modes.clear()
+
+
+@pytest.fixture(autouse=True)
 def set_api_keys() -> Generator[None, None, None]:
     """Set API keys for tests that use container fixture."""
     # Container fixture initializes ServiceRegistry which requires OPENAI_API_KEY
@@ -143,7 +151,7 @@ def test_that_openrouter_service_initializes_with_custom_model() -> None:
         os.environ,
         {
             "OPENROUTER_API_KEY": "test-key",
-            "OPENROUTER_MODEL": "anthropic/claude-3.5-sonnet",
+            "OPENROUTER_MODEL": "anthropic/claude-sonnet-4.6",
         },
         clear=True,
     ):
@@ -151,7 +159,7 @@ def test_that_openrouter_service_initializes_with_custom_model() -> None:
         mock_meter = Mock()
         mock_tracer = Mock()
         service = OpenRouterService(logger=mock_logger, tracer=mock_tracer, meter=mock_meter)
-        assert service.model_name == "anthropic/claude-3.5-sonnet"
+        assert service.model_name == "anthropic/claude-sonnet-4.6"
 
 
 def test_that_openrouter_service_uses_environment_model() -> None:
@@ -581,6 +589,51 @@ async def test_that_openrouter_generator_falls_back_to_json_object_when_json_sch
     assert calls[2].kwargs["response_format"]["type"] == "json_object"
 
 
+async def test_that_response_format_demotion_is_shared_across_instances_of_the_same_model(
+    container: Container,
+) -> None:
+    """A json_schema rejection learned by one generator instance is reused by new
+    instances for the same model, so re-created generators skip the rejected mode
+    without wasting an API round-trip."""
+    model_name = "shared/demotion-model"
+
+    with _openrouter_generator(
+        container,
+        create_side_effect=[
+            BadRequestError(
+                "Provider returned error: json_schema response_format is not supported",
+                response=Mock(),
+                body=None,
+            ),
+            _make_chat_response(
+                '{"test_field": "first"}',
+                CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            ),
+        ],
+        model_name=model_name,
+    ) as (first_generator, _):
+        await first_generator.do_generate("First request")
+
+    with _openrouter_generator(
+        container,
+        create_side_effect=[
+            _make_chat_response(
+                '{"test_field": "second"}',
+                CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            ),
+        ],
+        model_name=model_name,
+    ) as (second_generator, second_client):
+        result = await second_generator.do_generate("Second request")
+
+    assert result.content.test_field == "second"
+
+    # The fresh instance must start directly in json_object mode
+    calls = second_client.chat.completions.create.call_args_list
+    assert len(calls) == 1
+    assert calls[0].kwargs["response_format"]["type"] == "json_object"
+
+
 async def test_that_openrouter_generator_falls_back_when_no_endpoints_support_structured_outputs(
     container: Container,
 ) -> None:
@@ -725,6 +778,27 @@ def test_that_openrouter_service_returns_correct_generator_for_claude(
         generator = asyncio.run(service.get_schematic_generator(SchemaData))
         assert isinstance(generator, OpenRouterClaudeSonnet46)
         assert generator.model_name == "anthropic/claude-sonnet-4.6"
+
+
+def test_that_openrouter_service_returns_pinned_generator_for_versioned_slug(
+    container: Container,
+) -> None:
+    """Setting OPENROUTER_MODEL to the versioned slug a pinned class uses internally
+    must resolve to that pinned class, not a dynamic generator."""
+    with patch.dict(
+        os.environ,
+        {
+            "OPENROUTER_API_KEY": "test-key",
+            "OPENROUTER_MODEL": "openai/gpt-4o-2024-11-20",
+        },
+        clear=True,
+    ):
+        service = OpenRouterService(
+            logger=container[Logger], tracer=container[Tracer], meter=container[Meter]
+        )
+        generator = asyncio.run(service.get_schematic_generator(SchemaData))
+        assert isinstance(generator, OpenRouterGPT4O)
+        assert generator.max_tokens == 128 * 1024
 
 
 def test_that_openrouter_service_creates_dynamic_generator_for_unknown_model(

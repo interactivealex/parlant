@@ -28,7 +28,7 @@ from openai import (
 )
 from openai.types.chat import ChatCompletion
 from openai.types.completion_usage import CompletionUsage
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, ClassVar, Literal, Mapping
 from typing_extensions import override
 import json
 import jsonfinder  # type: ignore
@@ -131,8 +131,17 @@ class OpenRouterEstimatingTokenizer(EstimatingTokenizer):
         return len(tokens)
 
 
+_ResponseFormatMode = Literal["json_schema", "json_object", "plain"]
+
+
 class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
     supported_openrouter_params = ["temperature", "max_tokens"]
+
+    # Process-wide cache of the strongest response-format mode known to work per
+    # model. Demoted (json_schema -> json_object -> plain) when a provider rejects
+    # a mode, so neither this instance nor newly created generators for the same
+    # model waste a round-trip on an already-rejected mode.
+    _response_format_modes: ClassVar[dict[str, _ResponseFormatMode]] = {}
 
     def __init__(
         self,
@@ -146,15 +155,18 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
         self._client = _create_openrouter_client()
         self._tokenizer = OpenRouterEstimatingTokenizer(model_name=self.model_name)
 
-        # The strongest response-format mode known to work for this model.
-        # Demoted (json_schema -> json_object -> plain) when a provider rejects
-        # the mode, so failing modes are not retried on every request.
-        self._response_format_mode: Literal["json_schema", "json_object", "plain"] = "json_schema"
-
         # Optional completion-token cap, forwarded to the API as max_tokens.
         # A max_tokens hint always takes precedence over this value.
         completion_max_tokens = os.environ.get("OPENROUTER_COMPLETION_MAX_TOKENS")
         self._completion_max_tokens = int(completion_max_tokens) if completion_max_tokens else None
+
+    @property
+    def _response_format_mode(self) -> _ResponseFormatMode:
+        return self._response_format_modes.get(self.model_name, "json_schema")
+
+    @_response_format_mode.setter
+    def _response_format_mode(self, mode: _ResponseFormatMode) -> None:
+        self._response_format_modes[self.model_name] = mode
 
     @property
     @override
@@ -217,7 +229,13 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
     @staticmethod
     def _is_structured_outputs_rejection(error: Exception) -> bool:
         """Heuristically detect provider errors caused by the json_schema
-        response_format / structured-outputs requirement."""
+        response_format / structured-outputs requirement.
+
+        String matching is used because OpenRouter forwards upstream provider
+        errors verbatim (often wrapped) without stable machine-readable codes.
+        A false positive only costs one extra request in a weaker mode, and the
+        demotion is memoized per model.
+        """
         error_str = str(error).lower()
         return any(
             marker in error_str
@@ -361,6 +379,12 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
 
         if response.usage:
             self.logger.trace(response.usage.model_dump_json(indent=2))
+
+        if not response.choices[0].message.content:
+            self.logger.warning(
+                f"Empty response content from '{self.model_name}';"
+                f" treating it as an empty JSON object."
+            )
 
         raw_content = response.choices[0].message.content or "{}"
 
@@ -678,15 +702,24 @@ Please set OPENROUTER_API_KEY in your environment before running Parlant.
         Returns the specialized generator class for known models.
         For unknown models, creates a dynamic generator that works with any OpenRouter model.
         """
+        # Both the canonical short slugs and the versioned slugs the pinned classes
+        # use internally resolve to the pinned classes, so users configuring either
+        # form get the correct context-window limits.
         model_mapping: dict[
             str, Callable[[Logger, Tracer, Meter], OpenRouterSchematicGenerator[T]]
         ] = {
             "openai/gpt-4o": lambda logger, tracer, meter: OpenRouterGPT4O[t](  # type: ignore
                 logger, tracer, meter
             ),
+            "openai/gpt-4o-2024-11-20": lambda logger, tracer, meter: OpenRouterGPT4O[t](  # type: ignore
+                logger, tracer, meter
+            ),
             "openai/gpt-4o-mini": lambda logger, tracer, meter: OpenRouterGPT4OMini[t](  # type: ignore
                 logger, tracer, meter
             ),
+            "openai/gpt-4o-mini-2024-07-18": lambda logger, tracer, meter: OpenRouterGPT4OMini[
+                t  # type: ignore
+            ](logger, tracer, meter),
             "anthropic/claude-sonnet-4.6": lambda logger, tracer, meter: OpenRouterClaudeSonnet46[
                 t  # type: ignore
             ](logger, tracer, meter),

@@ -42,7 +42,8 @@ class _MeterCounters(TypedDict):
 
 
 # Per-meter counter cache. Weak keys let short-lived meters (e.g. in tests) be
-# garbage-collected together with their counters.
+# garbage-collected together with their counters. Note: WeakKeyDictionary is not
+# thread-safe; this is fine under asyncio's single-threaded execution model.
 _METER_COUNTERS: weakref.WeakKeyDictionary[Meter, _MeterCounters] = weakref.WeakKeyDictionary()
 
 

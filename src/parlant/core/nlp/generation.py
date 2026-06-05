@@ -36,7 +36,8 @@ T = TypeVar("T", bound=DefaultBaseModel)
 
 # Per-meter histogram cache. Weak keys let short-lived meters (e.g. in tests) be
 # garbage-collected together with their histograms (mirroring record_llm_metrics
-# in adapters/nlp/common.py).
+# in adapters/nlp/common.py). Note: WeakKeyDictionary is not thread-safe; this is
+# fine under asyncio's single-threaded execution model.
 _DURATION_HISTOGRAMS: weakref.WeakKeyDictionary[Meter, dict[str, DurationHistogram]] = (
     weakref.WeakKeyDictionary()
 )

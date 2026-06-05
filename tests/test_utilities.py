@@ -834,8 +834,12 @@ class RecordingMeter(Meter):
 
     @override
     def create_counter(self, name: str, description: str) -> Counter:
-        counter = RecordingCounter()
-        self.counters[name] = counter
+        # Reuse existing counters by name (mirroring OTEL instrument semantics) so
+        # repeated create_counter calls don't silently discard recorded calls.
+        counter = self.counters.get(name)
+        if counter is None:
+            counter = RecordingCounter()
+            self.counters[name] = counter
         return counter
 
     @override
