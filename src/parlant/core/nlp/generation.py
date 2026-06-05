@@ -15,8 +15,12 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
+import json
 from typing import Any, AsyncIterator, Callable, Generic, Mapping, TypeVar, cast, get_args
 from typing_extensions import override
+import weakref
+
+from pydantic import ValidationError
 
 from parlant.core.async_utils import Stopwatch
 from parlant.core.common import DefaultBaseModel
@@ -28,6 +32,31 @@ from parlant.core.nlp.tokenization import EstimatingTokenizer
 from parlant.core.tracer import Tracer
 
 T = TypeVar("T", bound=DefaultBaseModel)
+
+
+# Per-meter histogram cache. Weak keys let short-lived meters (e.g. in tests) be
+# garbage-collected together with their histograms (mirroring record_llm_metrics
+# in adapters/nlp/common.py). Note: WeakKeyDictionary is not thread-safe; this is
+# fine under asyncio's single-threaded execution model.
+_DURATION_HISTOGRAMS: weakref.WeakKeyDictionary[Meter, dict[str, DurationHistogram]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _get_or_create_duration_histogram(
+    meter: Meter,
+    name: str,
+    description: str,
+) -> DurationHistogram:
+    """Return the named duration histogram for *meter*, creating it on first call."""
+    histograms = _DURATION_HISTOGRAMS.setdefault(meter, {})
+
+    histogram = histograms.get(name)
+    if histogram is None:
+        histogram = meter.create_duration_histogram(name=name, description=description)
+        histograms[name] = histogram
+
+    return histogram
 
 
 # ============================================================================
@@ -98,9 +127,6 @@ class StreamingTextGenerator(ABC):
         ...
 
 
-_STREAMING_REQUEST_DURATION_HISTOGRAM: DurationHistogram | None = None
-
-
 class BaseStreamingTextGenerator(StreamingTextGenerator):
     """Base class for streaming text generators with tracing and metrics."""
 
@@ -110,12 +136,11 @@ class BaseStreamingTextGenerator(StreamingTextGenerator):
         self.meter = meter
         self.model_name = model_name
 
-        global _STREAMING_REQUEST_DURATION_HISTOGRAM
-        if _STREAMING_REQUEST_DURATION_HISTOGRAM is None:
-            _STREAMING_REQUEST_DURATION_HISTOGRAM = meter.create_duration_histogram(
-                name="stream",
-                description="Duration of streaming generation requests in milliseconds",
-            )
+        self._request_duration_histogram = _get_or_create_duration_histogram(
+            meter,
+            name="stream",
+            description="Duration of streaming generation requests in milliseconds",
+        )
 
     @abstractmethod
     async def do_generate(
@@ -138,8 +163,6 @@ class BaseStreamingTextGenerator(StreamingTextGenerator):
         prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
     ) -> StreamingTextGenerationResult:
-        assert _STREAMING_REQUEST_DURATION_HISTOGRAM is not None
-
         start = Stopwatch.start()
         stream_complete = False
         duration: float = 0.0
@@ -251,22 +274,22 @@ class SchematicGenerator(ABC, Generic[T]):
         ...
 
 
-_REQUEST_DURATION_HISTOGRAM: DurationHistogram | None = None
-
-
 class BaseSchematicGenerator(SchematicGenerator[T]):
+    # Number of retries after a schema-validation failure (so N+1 attempts total).
+    # Override as a class attribute in subclasses; do not mutate on instances.
+    schema_validation_retries: int = 2
+
     def __init__(self, logger: Logger, tracer: Tracer, meter: Meter, model_name: str) -> None:
         self.logger = logger
         self.tracer = tracer
         self.meter = meter
         self.model_name = model_name
 
-        global _REQUEST_DURATION_HISTOGRAM
-        if _REQUEST_DURATION_HISTOGRAM is None:
-            _REQUEST_DURATION_HISTOGRAM = meter.create_duration_histogram(
-                name="gen",
-                description="Duration of generation requests in milliseconds",
-            )
+        self._request_duration_histogram = _get_or_create_duration_histogram(
+            meter,
+            name="gen",
+            description="Duration of generation requests in milliseconds",
+        )
 
     @abstractmethod
     async def do_generate(
@@ -281,9 +304,15 @@ class BaseSchematicGenerator(SchematicGenerator[T]):
         prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
     ) -> SchematicGenerationResult[T]:
-        assert _REQUEST_DURATION_HISTOGRAM is not None
+        """Generate content, retrying on schema-validation failures.
 
-        async with _REQUEST_DURATION_HISTOGRAM.measure(
+        ValidationError and json.JSONDecodeError raised by do_generate() are
+        retried here (see schema_validation_retries) — do_generate()
+        implementations should NOT add their own retry for these errors.
+        When wrapped in a FallbackSchematicGenerator, the next generator is
+        only tried after these retries are exhausted.
+        """
+        async with self._request_duration_histogram.measure(
             {
                 "class.name": self.__class__.__qualname__,
                 "model.name": self.model_name,
@@ -292,29 +321,83 @@ class BaseSchematicGenerator(SchematicGenerator[T]):
         ):
             start = Stopwatch.start()
 
-            try:
-                result = await self.do_generate(prompt, hints)
-            except Exception:
-                self.tracer.add_event(
-                    "gen.request_failed",
-                    attributes={
-                        "model.name": self.model_name,
-                        "schema.name": self.schema.__name__,
-                        "duration": start.elapsed,
-                    },
-                )
-                raise
-            else:
-                self.tracer.add_event(
-                    "gen.request_completed",
-                    attributes={
-                        "model.name": self.model_name,
-                        "schema.name": self.schema.__name__,
-                        "duration": start.elapsed,
-                    },
-                )
+            last_error: ValidationError | json.JSONDecodeError | None = None
+            current_prompt: str | PromptBuilder = prompt
 
-            return result
+            for attempt in range(self.schema_validation_retries + 1):
+                try:
+                    result = await self.do_generate(current_prompt, hints)
+                except (ValidationError, json.JSONDecodeError) as exc:
+                    last_error = exc
+
+                    self.logger.warning(
+                        f"Schema validation failed on attempt {attempt + 1}"
+                        f"/{self.schema_validation_retries + 1} for"
+                        f" {self.schema.__name__}: {exc}"
+                    )
+
+                    self.tracer.add_event(
+                        "gen.request_retried",
+                        attributes={
+                            "model.name": self.model_name,
+                            "schema.name": self.schema.__name__,
+                            "attempt": attempt + 1,
+                            "error.type": type(exc).__name__,
+                        },
+                    )
+
+                    if attempt == self.schema_validation_retries:
+                        # Out of attempts — re-raise below.
+                        break
+
+                    if attempt + 1 == self.schema_validation_retries:
+                        # The next attempt is the final one: augment the prompt with
+                        # the validation error. Earlier retries reuse the prompt
+                        # unchanged.
+                        base_prompt = (
+                            prompt.build() if isinstance(prompt, PromptBuilder) else prompt
+                        )
+                        error_summary = str(exc)[:500]
+                        current_prompt = (
+                            f"{base_prompt}\n\n"
+                            "IMPORTANT: Your previous response failed JSON schema validation"
+                            " with the following error."
+                            " Respond ONLY with a single JSON object that strictly conforms"
+                            " to the expected schema.\n"
+                            f"Error: {error_summary}"
+                        )
+                except Exception:
+                    self.tracer.add_event(
+                        "gen.request_failed",
+                        attributes={
+                            "model.name": self.model_name,
+                            "schema.name": self.schema.__name__,
+                            "duration": start.elapsed,
+                        },
+                    )
+                    raise
+                else:
+                    self.tracer.add_event(
+                        "gen.request_completed",
+                        attributes={
+                            "model.name": self.model_name,
+                            "schema.name": self.schema.__name__,
+                            "duration": start.elapsed,
+                        },
+                    )
+                    return result
+
+            # All validation-error attempts exhausted — report failure and re-raise.
+            assert last_error is not None
+            self.tracer.add_event(
+                "gen.request_failed",
+                attributes={
+                    "model.name": self.model_name,
+                    "schema.name": self.schema.__name__,
+                    "duration": start.elapsed,
+                },
+            )
+            raise last_error
 
 
 class FallbackSchematicGenerator(SchematicGenerator[T]):

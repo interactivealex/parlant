@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from __future__ import annotations
+from functools import cached_property
 import time
 from openai import (
     APIConnectionError,
@@ -22,9 +23,12 @@ from openai import (
     BadRequestError,
     ConflictError,
     InternalServerError,
+    NotFoundError,
     RateLimitError,
 )
-from typing import Any, Callable, Mapping
+from openai.types.chat import ChatCompletion
+from openai.types.completion_usage import CompletionUsage
+from typing import Any, Callable, ClassVar, Literal, Mapping
 from typing_extensions import override
 import json
 import jsonfinder  # type: ignore
@@ -33,7 +37,7 @@ import os
 from pydantic import ValidationError
 import tiktoken
 
-from parlant.adapters.nlp.common import normalize_json_output
+from parlant.adapters.nlp.common import normalize_json_output, record_llm_metrics
 from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.loggers import Logger
 from parlant.core.meter import Meter
@@ -77,10 +81,48 @@ class OpenRouterEmptyEmbeddingResponseError(Exception):
     """Raised when OpenRouter returns an embedding response with no vectors."""
 
 
+def _create_openrouter_client() -> AsyncClient:
+    """Create an OpenAI-compatible client for the OpenRouter API, including the
+    optional attribution headers OpenRouter supports.
+
+    OPENROUTER_BASE_URL redirects requests to an OpenRouter-compatible gateway
+    (e.g. a proxy that forwards to OpenRouter)."""
+    extra_headers: dict[str, str] = {}
+    if "OPENROUTER_HTTP_REFERER" in os.environ:
+        extra_headers["HTTP-Referer"] = os.environ["OPENROUTER_HTTP_REFERER"]
+    if "OPENROUTER_SITE_NAME" in os.environ:
+        extra_headers["X-Title"] = os.environ["OPENROUTER_SITE_NAME"]
+
+    return AsyncClient(
+        base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        api_key=os.environ["OPENROUTER_API_KEY"],
+        default_headers=extra_headers if extra_headers else None,
+    )
+
+
+def _extract_cached_input_tokens(usage: CompletionUsage | None) -> int:
+    """Extract the number of cache-hit prompt tokens from a usage payload.
+
+    OpenRouter normalizes cache reporting to the OpenAI-compatible
+    usage.prompt_tokens_details.cached_tokens field; some providers (e.g.
+    DeepSeek) additionally attach a non-standard prompt_cache_hit_tokens field.
+    """
+    if usage is None:
+        return 0
+
+    details = getattr(usage, "prompt_tokens_details", None)
+    detail_cached = getattr(details, "cached_tokens", None) if details is not None else None
+    if isinstance(detail_cached, int):
+        return detail_cached
+
+    legacy_cached = getattr(usage, "prompt_cache_hit_tokens", None)
+    return legacy_cached if isinstance(legacy_cached, int) else 0
+
+
 class OpenRouterEstimatingTokenizer(EstimatingTokenizer):
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
-        # Use gpt-4 encoding as default for token estimation
+        # Use the gpt-4o encoding as a default approximation for token estimation
         self.encoding = tiktoken.encoding_for_model("gpt-4o-2024-08-06")
 
     @override
@@ -89,8 +131,17 @@ class OpenRouterEstimatingTokenizer(EstimatingTokenizer):
         return len(tokens)
 
 
+_ResponseFormatMode = Literal["json_schema", "json_object", "plain"]
+
+
 class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
     supported_openrouter_params = ["temperature", "max_tokens"]
+
+    # Process-wide cache of the strongest response-format mode known to work per
+    # model. Demoted (json_schema -> json_object -> plain) when a provider rejects
+    # a mode, so neither this instance nor newly created generators for the same
+    # model waste a round-trip on an already-rejected mode.
+    _response_format_modes: ClassVar[dict[str, _ResponseFormatMode]] = {}
 
     def __init__(
         self,
@@ -100,22 +151,22 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
         meter: Meter,
     ) -> None:
         super().__init__(logger=logger, tracer=tracer, meter=meter, model_name=model_name)
-        self._logger = logger
 
-        # Build extra headers from environment variables
-        extra_headers = {}
-        if "OPENROUTER_HTTP_REFERER" in os.environ:
-            extra_headers["HTTP-Referer"] = os.environ["OPENROUTER_HTTP_REFERER"]
-        if "OPENROUTER_SITE_NAME" in os.environ:
-            extra_headers["X-Title"] = os.environ["OPENROUTER_SITE_NAME"]
-
-        self._client = AsyncClient(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ["OPENROUTER_API_KEY"],
-            default_headers=extra_headers if extra_headers else None,
-        )
-
+        self._client = _create_openrouter_client()
         self._tokenizer = OpenRouterEstimatingTokenizer(model_name=self.model_name)
+
+        # Optional completion-token cap, forwarded to the API as max_tokens.
+        # A max_tokens hint always takes precedence over this value.
+        completion_max_tokens = os.environ.get("OPENROUTER_COMPLETION_MAX_TOKENS")
+        self._completion_max_tokens = int(completion_max_tokens) if completion_max_tokens else None
+
+    @property
+    def _response_format_mode(self) -> _ResponseFormatMode:
+        return self._response_format_modes.get(self.model_name, "json_schema")
+
+    @_response_format_mode.setter
+    def _response_format_mode(self, mode: _ResponseFormatMode) -> None:
+        self._response_format_modes[self.model_name] = mode
 
     @property
     @override
@@ -132,6 +183,24 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
     def max_tokens(self) -> int:
         # Default implementation - should be overridden by subclasses
         return 8192
+
+    @cached_property
+    def _schema_json(self) -> dict[str, Any]:
+        """The JSON Schema of the target schema, computed once per instance.
+
+        Strict structured-output providers (e.g. OpenAI) require object nodes to
+        carry additionalProperties=false and every property to be required, so the
+        schema is transformed with the OpenAI SDK's strict converter. When the
+        transformation is unavailable or rejects the schema, the raw Pydantic
+        schema is sent instead; providers that then refuse it trigger the
+        json_object fallback in _create_completion.
+        """
+        try:
+            from openai.lib._pydantic import to_strict_json_schema
+
+            return dict(to_strict_json_schema(self.schema))
+        except Exception:
+            return self.schema.model_json_schema()
 
     @policy(
         [
@@ -154,6 +223,146 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
         prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
     ) -> SchematicGenerationResult[T]:
+        with self.logger.scope(f"OpenRouter LLM Request ({self.schema.__name__})"):
+            return await self._do_generate(prompt, hints)
+
+    @staticmethod
+    def _is_structured_outputs_rejection(error: Exception) -> bool:
+        """Heuristically detect provider errors caused by the json_schema
+        response_format / structured-outputs requirement.
+
+        String matching is used because OpenRouter forwards upstream provider
+        errors verbatim (often wrapped) without stable machine-readable codes.
+        A false positive only costs one extra request in a weaker mode, and the
+        demotion is memoized per model.
+        """
+        error_str = str(error).lower()
+        return any(
+            marker in error_str
+            for marker in (
+                "json_schema",
+                "json schema",
+                # "json mode" deliberately overlaps with _is_json_mode_rejection:
+                # a JSON-mode rejection while in json_schema mode demotes to
+                # json_object first, and only then (if it fails again) to plain.
+                "json mode",
+                "structured output",
+                "structured_outputs",
+                "response_format",
+                "require_parameters",
+                "no endpoints found",
+            )
+        )
+
+    @staticmethod
+    def _is_json_mode_rejection(error: Exception) -> bool:
+        """Heuristically detect provider errors caused by JSON mode."""
+        error_str = str(error)
+        return "JSON mode" in error_str or "json_object" in error_str.lower()
+
+    async def _create_completion(
+        self,
+        prompt: str,
+        api_arguments: Mapping[str, Any],
+    ) -> ChatCompletion:
+        """Issue a chat-completion request, transmitting the schema with the
+        strongest response-format mode the model supports.
+
+        Modes demote monotonically (json_schema -> json_object -> plain) when a
+        provider rejects one, and the working mode is memoized per instance.
+        """
+        while True:
+            mode = self._response_format_mode
+            try:
+                response: ChatCompletion
+
+                if mode == "json_schema":
+                    response = await self._client.chat.completions.create(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=self.model_name,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": self.schema.__name__,
+                                "strict": True,
+                                "schema": self._schema_json,
+                            },
+                        },
+                        extra_body={"provider": {"require_parameters": True}},
+                        **api_arguments,
+                    )
+                elif mode == "json_object":
+                    response = await self._client.chat.completions.create(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=self.model_name,
+                        response_format={"type": "json_object"},
+                        **api_arguments,
+                    )
+                else:
+                    # Last resort: instruct the model to emit JSON via a system
+                    # message, without any response_format enforcement.
+                    json_instruction = (
+                        "IMPORTANT: You must respond with ONLY valid JSON. "
+                        "No explanatory text before or after the JSON. "
+                        "The response must be a valid JSON object."
+                    )
+                    response = await self._client.chat.completions.create(
+                        messages=[
+                            {"role": "system", "content": json_instruction},
+                            {"role": "user", "content": prompt},
+                        ],
+                        model=self.model_name,
+                        **api_arguments,
+                    )
+
+                return response
+            except (BadRequestError, NotFoundError) as e:
+                if mode == "json_schema" and self._is_structured_outputs_rejection(e):
+                    self.logger.warning(
+                        f"Model '{self.model_name}' rejected json_schema structured outputs"
+                        f" ({type(e).__name__}: {e}).\n"
+                        f"Falling back to JSON mode for this generator instance."
+                    )
+                    self._response_format_mode = "json_object"
+                    continue
+
+                if mode == "json_object" and self._is_json_mode_rejection(e):
+                    self.logger.warning(
+                        f"Model '{self.model_name}' does not support JSON mode"
+                        f" ({type(e).__name__}: {e}).\n"
+                        f"Please consider switching to a model that supports JSON mode"
+                        f" (e.g., 'openai/gpt-4o', 'anthropic/claude-sonnet-4.6').\n"
+                        f"Falling back to plain JSON instructions, but results may be"
+                        f" less reliable."
+                    )
+                    self._response_format_mode = "plain"
+                    continue
+
+                self.logger.error(f"OpenRouter API {type(e).__name__}: {e}")
+                raise
+            except RateLimitError:
+                self.logger.error(
+                    f"\nRate limit exceeded for model '{self.model_name}'.\n"
+                    f"{RATE_LIMIT_ERROR_MESSAGE}\n"
+                    f"Consider:\n"
+                    f"  - Using a different model\n"
+                    f"  - Waiting a moment before retrying\n"
+                    f"  - Adding your own API key for higher limits\n"
+                )
+                raise
+            except Exception as e:
+                self.logger.error(
+                    f"\nOpenRouter API error with model '{self.model_name}': {type(e).__name__}\n"
+                    f"{e}\n"
+                    f"Consider switching to a more compatible model.\n"
+                )
+                raise
+
+    async def _do_generate(
+        self,
+        prompt: str | PromptBuilder,
+        hints: Mapping[str, Any] = {},
+    ) -> SchematicGenerationResult[T]:
         if isinstance(prompt, PromptBuilder):
             prompt = prompt.build()
 
@@ -161,159 +370,92 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
             k: v for k, v in hints.items() if k in self.supported_openrouter_params
         }
 
+        if "max_tokens" not in openrouter_api_arguments and self._completion_max_tokens is not None:
+            openrouter_api_arguments["max_tokens"] = self._completion_max_tokens
+
         t_start = time.time()
-
-        # Try with JSON mode first, but catch errors gracefully
-        response = None
-
-        try:
-            # Try with JSON mode
-            response = await self._client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model=self.model_name,
-                response_format={"type": "json_object"},
-                **openrouter_api_arguments,
-            )
-        except BadRequestError as e:
-            # Check if it's a JSON mode error
-            error_str = str(e)
-            if "JSON mode" in error_str or "json_object" in error_str.lower():
-                self._logger.error(
-                    f"\nModel '{self.model_name}' does not support JSON mode.\n"
-                    f"Please switch to a model that supports JSON mode (e.g., 'openai/gpt-4o', 'anthropic/claude-3.5-sonnet').\n"
-                    f"Attempting to continue without JSON mode enforcement, but results may be less reliable.\n"
-                )
-                # Retry without JSON mode with a system message to instruct JSON output
-                try:
-                    # Add system message to instruct the model to output JSON
-                    json_instruction = "IMPORTANT: You must respond with ONLY valid JSON. No explanatory text before or after the JSON. The response must be a valid JSON object."
-                    response = await self._client.chat.completions.create(
-                        messages=[
-                            {"role": "system", "content": json_instruction},
-                            {"role": "user", "content": prompt},
-                        ],
-                        model=self.model_name,
-                        **openrouter_api_arguments,
-                    )
-                except Exception as retry_error:
-                    self._logger.error(
-                        f"\nFailed to use model '{self.model_name}' even without JSON mode.\n"
-                        f"Error: {retry_error}\n"
-                        f"Please change your model to one that supports JSON mode or use a different model entirely.\n"
-                    )
-                    raise
-            else:
-                # Some other BadRequest error - just log it once and raise
-                self._logger.error(f"OpenRouter API BadRequest: {e}")
-                raise
-        except RateLimitError:
-            self._logger.error(
-                f"\nRate limit exceeded for model '{self.model_name}'.\n"
-                f"{RATE_LIMIT_ERROR_MESSAGE}\n"
-                f"Consider:\n"
-                f"  - Using a different model\n"
-                f"  - Waiting a moment before retrying\n"
-                f"  - Adding your own API key for higher limits\n"
-            )
-            raise
-        except Exception as e:
-            self._logger.error(
-                f"\nOpenRouter API error with model '{self.model_name}': {type(e).__name__}\n"
-                f"{e}\n"
-                f"Consider switching to a more compatible model.\n"
-            )
-            raise
-
+        response = await self._create_completion(prompt, openrouter_api_arguments)
         t_end = time.time()
 
         if response.usage:
-            self._logger.trace(response.usage.model_dump_json(indent=2))
+            self.logger.trace(response.usage.model_dump_json(indent=2))
+
+        if not response.choices[0].message.content:
+            self.logger.warning(
+                f"Empty response content from '{self.model_name}';"
+                f" treating it as an empty JSON object."
+            )
 
         raw_content = response.choices[0].message.content or "{}"
 
-        # Check if we got empty response
-        if not raw_content.strip() or raw_content.strip() == "{}":
-            self._logger.error(
-                f"\nModel '{self.model_name}' returned empty or invalid JSON.\n"
-                f"Response: {raw_content}\n"
-                f"This model may not be compatible with structured output requirements.\n"
-                f"Please switch to a model that supports JSON mode (e.g., 'openai/gpt-4o', 'anthropic/claude-3.5-sonnet').\n"
-            )
-            # Set empty JSON as fallback
-            json_content = {}
-        else:
+        try:
+            json_content = json.loads(normalize_json_output(raw_content))
+        except json.JSONDecodeError as decode_error:
+            self.logger.warning(f"Invalid JSON returned by {self.model_name}:\n{raw_content}")
             try:
-                json_content = json.loads(normalize_json_output(raw_content))
-                # Check if parsed JSON is empty
-                if not json_content or json_content == {}:
-                    self._logger.warning(
-                        "Model returned empty JSON object. Attempting to find JSON in response..."
-                    )
-                    # Try to find JSON in the response
-                    try:
-                        json_content = jsonfinder.only_json(raw_content)[2]
-                        if json_content and json_content != {}:
-                            self._logger.info("Found valid JSON content within response.")
-                    except Exception:
-                        self._logger.error(
-                            f"Could not extract valid JSON from response: {raw_content}"
-                        )
-            except json.JSONDecodeError:
-                self._logger.warning(f"Invalid JSON returned by {self.model_name}:\n{raw_content}")
-                try:
-                    # Try to extract JSON using jsonfinder
-                    json_content = jsonfinder.only_json(raw_content)[2]
-                    self._logger.warning("Found JSON content within model response; continuing...")
-                except Exception as finder_error:
-                    self._logger.error(
-                        f"\nCould not parse JSON from model response.\n"
-                        f"Raw response: {raw_content}\n"
-                        f"Error: {finder_error}\n"
-                        f"Model '{self.model_name}' may not be compatible.\n"
-                        f"Consider switching to a model that supports structured output.\n"
-                    )
-                    json_content = {}
+                json_content = jsonfinder.only_json(raw_content)[2]
+                self.logger.warning("Found JSON content within model response; continuing...")
+            except Exception:
+                self.logger.error(
+                    f"Could not extract valid JSON from the response of '{self.model_name}':\n"
+                    f"{raw_content}"
+                )
+                # Re-raise the original decoding error so that
+                # BaseSchematicGenerator.generate() can retry the generation.
+                raise decode_error
 
         try:
             content = self.schema.model_validate(json_content)
-
-            assert response.usage
-
-            return SchematicGenerationResult(
-                content=content,
-                info=GenerationInfo(
-                    schema_name=self.schema.__name__,
-                    model=self.id,
-                    duration=(t_end - t_start),
-                    usage=UsageInfo(
-                        input_tokens=response.usage.prompt_tokens,
-                        output_tokens=response.usage.completion_tokens,
-                        extra={
-                            "cached_input_tokens": getattr(
-                                response.usage,
-                                "prompt_cache_hit_tokens",
-                                0,
-                            )
-                        },
-                    ),
-                ),
-            )
         except ValidationError as e:
-            self._logger.error(
+            self.logger.error(
                 f"\nJSON content returned by '{self.model_name}' does not match expected schema.\n"
                 f"Schema: {self.schema.__name__}\n"
                 f"Raw response: {raw_content}\n"
                 f"Parsed JSON: {json.dumps(json_content, indent=2) if json_content else 'Empty'}\n"
                 f"Validation errors: {str(e)}\n"
-                f"This model may not be producing valid structured output.\n"
-                f"Consider switching to a model that supports JSON mode.\n"
             )
             raise
+
+        usage = response.usage
+        if usage is None:
+            self.logger.warning(
+                f"OpenRouter response for '{self.model_name}' did not include usage data;"
+                f" recording zero token counts."
+            )
+
+        input_tokens = (usage.prompt_tokens or 0) if usage else 0
+        output_tokens = (usage.completion_tokens or 0) if usage else 0
+        cached_input_tokens = _extract_cached_input_tokens(usage)
+
+        await record_llm_metrics(
+            self.meter,
+            self.model_name,
+            schema_name=self.schema.__name__,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
+        )
+
+        return SchematicGenerationResult(
+            content=content,
+            info=GenerationInfo(
+                schema_name=self.schema.__name__,
+                model=self.id,
+                duration=(t_end - t_start),
+                usage=UsageInfo(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    extra={"cached_input_tokens": cached_input_tokens},
+                ),
+            ),
+        )
 
 
 class OpenRouterGPT4O(OpenRouterSchematicGenerator[T]):
     def __init__(self, logger: Logger, tracer: Tracer, meter: Meter) -> None:
-        super().__init__(model_name="openai/gpt-4o", logger=logger, tracer=tracer, meter=meter)
+        super().__init__(
+            model_name="openai/gpt-4o-2024-11-20", logger=logger, tracer=tracer, meter=meter
+        )
 
     @property
     @override
@@ -323,7 +465,9 @@ class OpenRouterGPT4O(OpenRouterSchematicGenerator[T]):
 
 class OpenRouterGPT4OMini(OpenRouterSchematicGenerator[T]):
     def __init__(self, logger: Logger, tracer: Tracer, meter: Meter) -> None:
-        super().__init__(model_name="openai/gpt-4o-mini", logger=logger, tracer=tracer, meter=meter)
+        super().__init__(
+            model_name="openai/gpt-4o-mini-2024-07-18", logger=logger, tracer=tracer, meter=meter
+        )
 
     @property
     @override
@@ -331,16 +475,16 @@ class OpenRouterGPT4OMini(OpenRouterSchematicGenerator[T]):
         return 128 * 1024
 
 
-class OpenRouterClaude35Sonnet(OpenRouterSchematicGenerator[T]):
+class OpenRouterClaudeSonnet46(OpenRouterSchematicGenerator[T]):
     def __init__(self, logger: Logger, tracer: Tracer, meter: Meter) -> None:
         super().__init__(
-            model_name="anthropic/claude-3.5-sonnet", logger=logger, tracer=tracer, meter=meter
+            model_name="anthropic/claude-sonnet-4.6", logger=logger, tracer=tracer, meter=meter
         )
 
     @property
     @override
     def max_tokens(self) -> int:
-        return 8192
+        return 1_000_000
 
 
 class OpenRouterLlama33_70B(OpenRouterSchematicGenerator[T]):
@@ -355,7 +499,7 @@ class OpenRouterLlama33_70B(OpenRouterSchematicGenerator[T]):
     @property
     @override
     def max_tokens(self) -> int:
-        return 8192
+        return 128 * 1024
 
 
 class OpenRouterEmbedder(BaseEmbedder):
@@ -373,18 +517,7 @@ class OpenRouterEmbedder(BaseEmbedder):
     def __init__(self, model_name: str, logger: Logger, tracer: Tracer, meter: Meter) -> None:
         super().__init__(logger, tracer, meter, model_name)
 
-        # Build extra headers from environment variables
-        extra_headers = {}
-        if "OPENROUTER_HTTP_REFERER" in os.environ:
-            extra_headers["HTTP-Referer"] = os.environ["OPENROUTER_HTTP_REFERER"]
-        if "OPENROUTER_SITE_NAME" in os.environ:
-            extra_headers["X-Title"] = os.environ["OPENROUTER_SITE_NAME"]
-
-        self._client = AsyncClient(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ["OPENROUTER_API_KEY"],
-            default_headers=extra_headers if extra_headers else None,
-        )
+        self._client = _create_openrouter_client()
         self._tokenizer = OpenRouterEstimatingTokenizer(model_name=self.model_name)
         # Cache dimensions after first API call if not known
         self._cached_dimensions: int | None = None
@@ -569,16 +702,25 @@ Please set OPENROUTER_API_KEY in your environment before running Parlant.
         Returns the specialized generator class for known models.
         For unknown models, creates a dynamic generator that works with any OpenRouter model.
         """
+        # Both the canonical short slugs and the versioned slugs the pinned classes
+        # use internally resolve to the pinned classes, so users configuring either
+        # form get the correct context-window limits.
         model_mapping: dict[
             str, Callable[[Logger, Tracer, Meter], OpenRouterSchematicGenerator[T]]
         ] = {
             "openai/gpt-4o": lambda logger, tracer, meter: OpenRouterGPT4O[t](  # type: ignore
                 logger, tracer, meter
             ),
+            "openai/gpt-4o-2024-11-20": lambda logger, tracer, meter: OpenRouterGPT4O[t](  # type: ignore
+                logger, tracer, meter
+            ),
             "openai/gpt-4o-mini": lambda logger, tracer, meter: OpenRouterGPT4OMini[t](  # type: ignore
                 logger, tracer, meter
             ),
-            "anthropic/claude-3.5-sonnet": lambda logger, tracer, meter: OpenRouterClaude35Sonnet[
+            "openai/gpt-4o-mini-2024-07-18": lambda logger, tracer, meter: OpenRouterGPT4OMini[
+                t  # type: ignore
+            ](logger, tracer, meter),
+            "anthropic/claude-sonnet-4.6": lambda logger, tracer, meter: OpenRouterClaudeSonnet46[
                 t  # type: ignore
             ](logger, tracer, meter),
             "meta-llama/llama-3.3-70b-instruct": lambda logger, tracer, meter: (
@@ -598,15 +740,22 @@ Please set OPENROUTER_API_KEY in your environment before running Parlant.
         if max_tokens_str:
             max_tokens = int(max_tokens_str)
         else:
-            # Provide sensible defaults based on model family
-            if "gpt-4" in model_name:
-                max_tokens = 128 * 1024
-            elif "claude" in model_name:
-                max_tokens = 8192
-            elif "llama" in model_name or "gemma" in model_name:
-                max_tokens = 8192
-            else:
-                max_tokens = 8192  # Safe default for unknown models
+            # Ordered (first match wins) context-window defaults by model family.
+            family_context_windows = (
+                ("gpt-4", 128 * 1024),
+                ("claude", 200 * 1024),
+                ("llama-3", 128 * 1024),  # must precede the generic "llama" entry
+                ("llama", 8192),
+                ("gemma", 8192),
+            )
+            max_tokens = next(
+                (
+                    context_window
+                    for family, context_window in family_context_windows
+                    if family in model_name
+                ),
+                8192,  # Safe default for unknown models
+            )
 
         # Create dynamic generator class with the specific max_tokens
         final_max_tokens = max_tokens

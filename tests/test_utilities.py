@@ -52,6 +52,7 @@ from parlant.core.agents import Agent, AgentId, AgentStore
 from parlant.core.application import Application
 from parlant.core.async_utils import Timeout
 from parlant.core.common import DefaultBaseModel, JSONSerializable, Version
+from parlant.core.meter import Counter, DurationHistogram, Histogram, Meter
 from parlant.core.context_variables import (
     ContextVariable,
     ContextVariableId,
@@ -788,3 +789,63 @@ TOOLS = (
     one_required_query_param_one_required_body_param,
     dto_object,
 )
+
+
+class RecordingCounter(Counter):
+    """Counter that records every increment call for assertion in tests."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, Mapping[str, str] | None]] = []
+
+    @override
+    async def increment(
+        self,
+        value: int,
+        attributes: Mapping[str, str] | None = None,
+    ) -> None:
+        self.calls.append((value, attributes))
+
+
+class NullDurationHistogram(DurationHistogram):
+    """No-op DurationHistogram for test doubles."""
+
+    @override
+    async def record(
+        self,
+        value: float,
+        attributes: Mapping[str, str] | None = None,
+    ) -> None:
+        pass
+
+    @override
+    @asynccontextmanager
+    async def measure(
+        self,
+        attributes: Mapping[str, str] | None = None,
+    ) -> AsyncIterator[None]:
+        yield
+
+
+class RecordingMeter(Meter):
+    """Meter that creates named RecordingCounters and remembers them."""
+
+    def __init__(self) -> None:
+        self.counters: dict[str, RecordingCounter] = {}
+
+    @override
+    def create_counter(self, name: str, description: str) -> Counter:
+        # Reuse existing counters by name (mirroring OTEL instrument semantics) so
+        # repeated create_counter calls don't silently discard recorded calls.
+        counter = self.counters.get(name)
+        if counter is None:
+            counter = RecordingCounter()
+            self.counters[name] = counter
+        return counter
+
+    @override
+    def create_custom_histogram(self, name: str, description: str, unit: str) -> Histogram:
+        raise NotImplementedError
+
+    @override
+    def create_duration_histogram(self, name: str, description: str) -> DurationHistogram:
+        return NullDurationHistogram()
