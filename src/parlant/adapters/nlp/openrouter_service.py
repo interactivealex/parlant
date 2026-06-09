@@ -38,7 +38,7 @@ from pydantic import ValidationError
 import tiktoken
 
 from parlant.adapters.nlp.common import normalize_json_output, record_llm_metrics
-from parlant.core.engines.alpha.prompt_builder import PromptBuilder
+from parlant.core.engines.alpha.prompt_builder import BuiltInSection, PromptBuilder
 from parlant.core.loggers import Logger
 from parlant.core.meter import Meter
 from parlant.core.nlp.policies import policy, retry
@@ -134,6 +134,115 @@ class OpenRouterEstimatingTokenizer(EstimatingTokenizer):
 _ResponseFormatMode = Literal["json_schema", "json_object", "plain"]
 
 
+# A chat message's content is either a plain string or a list of content blocks;
+# the block form carries a per-block cache_control breakpoint for prompt caching.
+_ContentBlock = dict[str, Any]
+
+# Minimum stable-prefix size (characters) worth a cache breakpoint. Below the
+# common provider cache minimum (~1024 tokens ≈ 4096 chars) a breakpoint just adds
+# overhead without ever producing a cache hit.
+_MIN_CACHE_PREFIX_CHARS = 4096
+
+# PromptBuilder sections whose rendered content can change from one turn to the
+# next. The cacheable prefix is the contiguous run of sections *before* the first
+# of these. Only AGENT_IDENTITY / CUSTOMER_IDENTITY and custom (string-keyed)
+# instruction sections are treated as stable; unknown BuiltInSection members
+# default to stable, so any new per-turn section must be added here.
+_DYNAMIC_SECTIONS: frozenset[BuiltInSection] = frozenset(
+    {
+        BuiltInSection.CONTEXT_VARIABLES,
+        BuiltInSection.GLOSSARY,
+        BuiltInSection.CAPABILITIES,
+        BuiltInSection.GUIDELINE_DESCRIPTIONS,
+        BuiltInSection.GUIDELINES,
+        BuiltInSection.JOURNEYS,
+        BuiltInSection.OBSERVATIONS,
+        BuiltInSection.INTERACTION_HISTORY,
+        BuiltInSection.STAGED_EVENTS,
+    }
+)
+
+# The complement of _DYNAMIC_SECTIONS: built-in sections whose rendered content is
+# stable across turns and may safely sit inside the cached prefix.
+_STABLE_BUILTIN_SECTIONS: frozenset[BuiltInSection] = frozenset(
+    {
+        BuiltInSection.AGENT_IDENTITY,
+        BuiltInSection.CUSTOMER_IDENTITY,
+    }
+)
+
+# Force a deliberate classification of every BuiltInSection. A new member added to
+# the enum without being placed in exactly one of the two sets above trips this at
+# import time, rather than silently defaulting to "stable" and risking a per-turn
+# section being served from a stale cache.
+assert _DYNAMIC_SECTIONS | _STABLE_BUILTIN_SECTIONS == frozenset(BuiltInSection), (
+    "Every BuiltInSection must be classified as dynamic or stable for prompt caching; "
+    f"unclassified: {frozenset(BuiltInSection) - (_DYNAMIC_SECTIONS | _STABLE_BUILTIN_SECTIONS)}"
+)
+assert not (_DYNAMIC_SECTIONS & _STABLE_BUILTIN_SECTIONS), (
+    "A BuiltInSection cannot be both dynamic and stable: "
+    f"{_DYNAMIC_SECTIONS & _STABLE_BUILTIN_SECTIONS}"
+)
+
+
+def _split_prompt_for_caching(
+    prompt: PromptBuilder,
+    built: str,
+    *,
+    ttl: str | None,
+    min_prefix_chars: int,
+) -> list[_ContentBlock] | None:
+    """Split an already-built prompt into a cached stable-prefix block and an
+    uncached variable-tail block, or return None when no worthwhile split exists.
+
+    *built* is ``prompt.build()``'s output, passed in so the full prompt is
+    rendered only once. The breakpoint is placed before the first per-turn
+    (dynamic) section; only the leading prefix sections are re-rendered, to locate
+    the cut point. The two block texts concatenate to exactly *built*, so the
+    prompt the model receives is byte-for-byte unchanged.
+    """
+    items = list(prompt.sections.items())
+
+    first_dynamic = next(
+        (i for i, (name, _) in enumerate(items) if name in _DYNAMIC_SECTIONS),
+        None,
+    )
+    # No dynamic section (nothing to keep out of the cache), or the very first
+    # section is already dynamic (no stable prefix) -> nothing worthwhile to cache.
+    if first_dynamic is None or first_dynamic == 0:
+        return None
+
+    # Re-render only the prefix sections to find where the cacheable prefix ends in
+    # `built`. build() joins sections with "\n\n" then strips, so this lstripped
+    # join is a true prefix of `built` and the slice below reproduces it exactly.
+    prefix_text = (
+        "\n\n".join(
+            section.template.format(**section.props) for _, section in items[:first_dynamic]
+        )
+        + "\n\n"
+    ).lstrip()
+    if len(prefix_text) < min_prefix_chars:
+        return None
+
+    # The re-rendered prefix must be a literal prefix of `built`; otherwise the
+    # slice below would silently corrupt the prompt. This holds as long as section
+    # rendering is deterministic (no per-call state in template.format), so guard it.
+    assert built.startswith(prefix_text), "cache prefix is not a prefix of the built prompt"
+    suffix_text = built[len(prefix_text) :]
+
+    # {"type": "ephemeral"} is the standard breakpoint; the optional "ttl" (e.g.
+    # "1h") is honored by OpenRouter and Anthropic's extended-TTL cache. Providers
+    # that don't support caching ignore the whole key.
+    cache_control: dict[str, Any] = {"type": "ephemeral"}
+    if ttl:
+        cache_control["ttl"] = ttl
+
+    return [
+        {"type": "text", "text": prefix_text, "cache_control": cache_control},
+        {"type": "text", "text": suffix_text},
+    ]
+
+
 class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
     supported_openrouter_params = ["temperature", "max_tokens"]
 
@@ -142,6 +251,11 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
     # a mode, so neither this instance nor newly created generators for the same
     # model waste a round-trip on an already-rejected mode.
     _response_format_modes: ClassVar[dict[str, _ResponseFormatMode]] = {}
+
+    # Models observed to reject the content-block / cache_control message shape.
+    # Such models fall back to a plain-string prompt and skip the cache breakpoint
+    # for the rest of the process, avoiding a wasted round-trip on every request.
+    _cache_blocks_unsupported: ClassVar[set[str]] = set()
 
     def __init__(
         self,
@@ -159,6 +273,14 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
         # A max_tokens hint always takes precedence over this value.
         completion_max_tokens = os.environ.get("OPENROUTER_COMPLETION_MAX_TOKENS")
         self._completion_max_tokens = int(completion_max_tokens) if completion_max_tokens else None
+
+        # Prompt caching: split the prompt so its large, stable prefix carries a
+        # cache_control breakpoint (honored by Gemini, required by Anthropic Claude,
+        # ignored by others). On by default; OPENROUTER_PROMPT_CACHE=false restores
+        # the legacy flat-string request.
+        cache_flag = os.environ.get("OPENROUTER_PROMPT_CACHE", "true").strip().lower()
+        self._prompt_caching_enabled = cache_flag not in ("0", "false", "no", "off")
+        self._cache_ttl = os.environ.get("OPENROUTER_PROMPT_CACHE_TTL", "").strip() or None
 
     @property
     def _response_format_mode(self) -> _ResponseFormatMode:
@@ -260,17 +382,57 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
         error_str = str(error)
         return "JSON mode" in error_str or "json_object" in error_str.lower()
 
+    @staticmethod
+    def _is_content_block_rejection(error: Exception) -> bool:
+        """Heuristically detect provider errors caused by the content-block /
+        cache_control message shape, as opposed to an unrelated 400 (bad model
+        slug, malformed schema, quota error).
+
+        Like the response-format heuristics above, this matches the forwarded
+        upstream error text. The guard must be *positive*: an unrelated 400 that
+        merely happens while sending content blocks must not be mistaken for a
+        shape rejection, or the model would be permanently (per-process) memoized
+        as cache-incompatible. A false negative only fails the current turn loudly
+        (and is recoverable via OPENROUTER_PROMPT_CACHE=false); a false positive
+        silently disables caching for the model, so we err toward the former.
+        """
+        error_str = str(error).lower()
+        return any(
+            marker in error_str
+            for marker in (
+                "cache_control",
+                "cache control",
+                "content block",
+                "message content",
+                "unsupported content",
+                "content must be a string",
+                "invalid type for 'content'",
+            )
+        )
+
     async def _create_completion(
         self,
         prompt: str,
         api_arguments: Mapping[str, Any],
+        *,
+        message_content: list[_ContentBlock] | None = None,
     ) -> ChatCompletion:
         """Issue a chat-completion request, transmitting the schema with the
         strongest response-format mode the model supports.
 
         Modes demote monotonically (json_schema -> json_object -> plain) when a
         provider rejects one, and the working mode is memoized per instance.
+
+        When *message_content* is a content-block list (a prompt-caching split) it
+        is used verbatim as the user message content. If a provider rejects the
+        content-block shape with a non-format error, the model is memoized as
+        block-incompatible and the request is retried with the plain string.
         """
+        # Held outside the loop so a content-block rejection can permanently drop
+        # back to the plain string for the remainder of this request. Typed Any
+        # because the content-block dicts intentionally carry a cache_control key
+        # the OpenAI SDK's message-param types reject but pass through to OpenRouter.
+        content: Any = message_content if message_content is not None else prompt
         while True:
             mode = self._response_format_mode
             try:
@@ -278,7 +440,7 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
 
                 if mode == "json_schema":
                     response = await self._client.chat.completions.create(
-                        messages=[{"role": "user", "content": prompt}],
+                        messages=[{"role": "user", "content": content}],
                         model=self.model_name,
                         response_format={
                             "type": "json_schema",
@@ -293,7 +455,7 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
                     )
                 elif mode == "json_object":
                     response = await self._client.chat.completions.create(
-                        messages=[{"role": "user", "content": prompt}],
+                        messages=[{"role": "user", "content": content}],
                         model=self.model_name,
                         response_format={"type": "json_object"},
                         **api_arguments,
@@ -309,7 +471,7 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
                     response = await self._client.chat.completions.create(
                         messages=[
                             {"role": "system", "content": json_instruction},
-                            {"role": "user", "content": prompt},
+                            {"role": "user", "content": content},
                         ],
                         model=self.model_name,
                         **api_arguments,
@@ -338,6 +500,22 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
                     self._response_format_mode = "plain"
                     continue
 
+                # Format rejections are handled above; if we failed while sending
+                # cache_control content blocks AND the error looks like a shape
+                # rejection, the provider doesn't accept that message form. Drop to
+                # a plain string, memoize the model, and retry. Unrelated 400s (bad
+                # slug, malformed schema, quota) fall through to the raise below so
+                # they aren't misattributed to caching.
+                if isinstance(content, list) and self._is_content_block_rejection(e):
+                    self.logger.warning(
+                        f"Model '{self.model_name}' rejected cache-control content"
+                        f" blocks ({type(e).__name__}: {e}).\n"
+                        f"Falling back to a plain-string prompt for this model."
+                    )
+                    self._cache_blocks_unsupported.add(self.model_name)
+                    content = prompt
+                    continue
+
                 self.logger.error(f"OpenRouter API {type(e).__name__}: {e}")
                 raise
             except RateLimitError:
@@ -363,8 +541,23 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
         prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
     ) -> SchematicGenerationResult[T]:
+        # Build the prompt once, then derive the cache split from the builder's
+        # sections (using the built string to avoid a second full render). Skipped
+        # for raw-string prompts and for models known to reject content blocks.
+        message_content: list[_ContentBlock] | None = None
         if isinstance(prompt, PromptBuilder):
-            prompt = prompt.build()
+            builder = prompt
+            prompt = builder.build()
+            if (
+                self._prompt_caching_enabled
+                and self.model_name not in self._cache_blocks_unsupported
+            ):
+                message_content = _split_prompt_for_caching(
+                    builder,
+                    prompt,
+                    ttl=self._cache_ttl,
+                    min_prefix_chars=_MIN_CACHE_PREFIX_CHARS,
+                )
 
         openrouter_api_arguments = {
             k: v for k, v in hints.items() if k in self.supported_openrouter_params
@@ -374,7 +567,9 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
             openrouter_api_arguments["max_tokens"] = self._completion_max_tokens
 
         t_start = time.time()
-        response = await self._create_completion(prompt, openrouter_api_arguments)
+        response = await self._create_completion(
+            prompt, openrouter_api_arguments, message_content=message_content
+        )
         t_end = time.time()
 
         if response.usage:

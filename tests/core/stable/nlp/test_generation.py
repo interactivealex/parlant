@@ -686,10 +686,12 @@ async def test_that_schematic_generation_retries_on_validation_error_and_succeed
     assert mock.await_count == 2
 
 
-async def test_that_schematic_generation_appends_corrective_note_on_second_retry(
+async def test_that_schematic_generation_reasks_with_error_on_every_retry(
     container: Container,
 ) -> None:
-    """Fail twice; on the third attempt the prompt must contain the error text."""
+    """Fail twice; BOTH retries (not just the final one) must carry the
+    corrective note. A blind resample of the original prompt is a wasted call.
+    """
     validation_error = _make_validation_error()
     success = _make_success_result()
 
@@ -711,12 +713,54 @@ async def test_that_schematic_generation_appends_corrective_note_on_second_retry
     assert result.content.result == "ok"
     assert mock.await_count == 3
 
-    third_prompt = captured_prompts[2]
-    assert isinstance(third_prompt, str)
-    assert "original prompt" in third_prompt
-    # The corrective note must contain some portion of the error message
     error_fragment = str(validation_error)[:50]
-    assert error_fragment in third_prompt
+
+    # Attempt 0 is the original prompt, unmodified.
+    assert captured_prompts[0] == "original prompt"
+
+    # Every retry (attempts 1 and 2) reasks with the error fed back.
+    for retry_prompt in captured_prompts[1:]:
+        assert isinstance(retry_prompt, str)
+        assert "original prompt" in retry_prompt
+        assert error_fragment in retry_prompt
+
+
+async def test_that_schematic_generation_lowers_temperature_on_retries(
+    container: Container,
+) -> None:
+    """The initial attempt honors the caller's temperature; every reask runs
+    at a low temperature for schema adherence (other hints preserved).
+    """
+    validation_error = _make_validation_error()
+    success = _make_success_result()
+
+    captured_hints: list[Mapping[str, Any]] = []
+
+    async def _side_effect(
+        prompt: str | PromptBuilder, hints: Mapping[str, Any]
+    ) -> SchematicGenerationResult[DummySchema]:
+        captured_hints.append(dict(hints))
+        if len(captured_hints) < 3:
+            raise validation_error
+        return success
+
+    mock = AsyncMock(side_effect=_side_effect)
+    generator = _make_generator(container, mock)
+
+    result = await generator.generate(
+        prompt="test prompt", hints={"temperature": 0.9, "max_tokens": 512}
+    )
+
+    assert result.content.result == "ok"
+    assert mock.await_count == 3
+
+    # Initial attempt: caller's temperature untouched.
+    assert captured_hints[0]["temperature"] == 0.9
+
+    # Reask attempts: forced low, other hints preserved.
+    for retry_hints in captured_hints[1:]:
+        assert retry_hints["temperature"] == 0.0
+        assert retry_hints["max_tokens"] == 512
 
 
 async def test_that_schematic_generation_raises_after_exhausting_retries(

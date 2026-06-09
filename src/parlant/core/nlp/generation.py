@@ -279,6 +279,11 @@ class BaseSchematicGenerator(SchematicGenerator[T]):
     # Override as a class attribute in subclasses; do not mutate on instances.
     schema_validation_retries: int = 2
 
+    # Reask attempts run at this (low) temperature for schema adherence —
+    # higher temperature increases format drift, the opposite of what a
+    # corrective attempt wants. The initial attempt keeps the caller's hints.
+    schema_validation_retry_temperature: float = 0.0
+
     def __init__(self, logger: Logger, tracer: Tracer, meter: Meter, model_name: str) -> None:
         self.logger = logger
         self.tracer = tracer
@@ -309,6 +314,9 @@ class BaseSchematicGenerator(SchematicGenerator[T]):
         ValidationError and json.JSONDecodeError raised by do_generate() are
         retried here (see schema_validation_retries) — do_generate()
         implementations should NOT add their own retry for these errors.
+        Each retry reasks: the original prompt is augmented with the validation
+        error so the model self-corrects, and the attempt runs at
+        schema_validation_retry_temperature (low) for schema adherence.
         When wrapped in a FallbackSchematicGenerator, the next generator is
         only tried after these retries are exhausted.
         """
@@ -325,8 +333,15 @@ class BaseSchematicGenerator(SchematicGenerator[T]):
             current_prompt: str | PromptBuilder = prompt
 
             for attempt in range(self.schema_validation_retries + 1):
+                # Reask attempts run at low temperature for schema adherence;
+                # the initial attempt honors the caller's hints.
+                attempt_hints = (
+                    hints
+                    if attempt == 0
+                    else {**hints, "temperature": self.schema_validation_retry_temperature}
+                )
                 try:
-                    result = await self.do_generate(current_prompt, hints)
+                    result = await self.do_generate(current_prompt, attempt_hints)
                 except (ValidationError, json.JSONDecodeError) as exc:
                     last_error = exc
 
@@ -350,22 +365,20 @@ class BaseSchematicGenerator(SchematicGenerator[T]):
                         # Out of attempts — re-raise below.
                         break
 
-                    if attempt + 1 == self.schema_validation_retries:
-                        # The next attempt is the final one: augment the prompt with
-                        # the validation error. Earlier retries reuse the prompt
-                        # unchanged.
-                        base_prompt = (
-                            prompt.build() if isinstance(prompt, PromptBuilder) else prompt
-                        )
-                        error_summary = str(exc)[:500]
-                        current_prompt = (
-                            f"{base_prompt}\n\n"
-                            "IMPORTANT: Your previous response failed JSON schema validation"
-                            " with the following error."
-                            " Respond ONLY with a single JSON object that strictly conforms"
-                            " to the expected schema.\n"
-                            f"Error: {error_summary}"
-                        )
+                    # Reask: feed the validation error back on every retry so the
+                    # model can self-correct rather than blindly resample the same
+                    # prompt. Rebuilt from the original prompt each time so the
+                    # corrective note never stacks across attempts.
+                    base_prompt = prompt.build() if isinstance(prompt, PromptBuilder) else prompt
+                    error_summary = str(exc)[:500]
+                    current_prompt = (
+                        f"{base_prompt}\n\n"
+                        "IMPORTANT: Your previous response failed JSON schema validation"
+                        " with the following error."
+                        " Respond ONLY with a single JSON object that strictly conforms"
+                        " to the expected schema.\n"
+                        f"Error: {error_summary}"
+                    )
                 except Exception:
                     self.tracer.add_event(
                         "gen.request_failed",

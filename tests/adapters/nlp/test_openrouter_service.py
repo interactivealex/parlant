@@ -40,6 +40,7 @@ from parlant.core.loggers import Logger
 from parlant.core.common import DefaultBaseModel
 from parlant.core.meter import Meter
 from parlant.core.tracer import Tracer
+from parlant.core.engines.alpha.prompt_builder import BuiltInSection, PromptBuilder
 
 from tests.test_utilities import RecordingMeter
 
@@ -96,12 +97,36 @@ def _openrouter_generator(
         yield generator, mock_client
 
 
+# --- Prompt-caching test helpers ---------------------------------------------
+
+# A static prefix comfortably above any reasonable cache min-size guard.
+_LARGE_STATIC_PREFIX = "You are a meticulous, helpful assistant. " * 250
+# A static prefix comfortably below any reasonable cache min-size guard.
+_SMALL_STATIC_PREFIX = "Be concise."
+
+
+def _make_prompt_builder(
+    sections: Sequence[tuple[str | BuiltInSection, str]],
+) -> PromptBuilder:
+    """Build a PromptBuilder from (section-name, literal-text) pairs.
+
+    Each text is used verbatim as the section template with empty props, so the
+    rendered section equals the text (the text must contain no literal braces).
+    """
+    builder = PromptBuilder()
+    for name, text in sections:
+        builder.add_section(name, text)
+    return builder
+
+
 @pytest.fixture(autouse=True)
 def reset_response_format_modes() -> Generator[None, None, None]:
-    """Isolate the process-wide response-format demotion cache between tests."""
+    """Isolate the process-wide response-format demotion and cache-block caches."""
     OpenRouterSchematicGenerator._response_format_modes.clear()
+    OpenRouterSchematicGenerator._cache_blocks_unsupported.clear()
     yield
     OpenRouterSchematicGenerator._response_format_modes.clear()
+    OpenRouterSchematicGenerator._cache_blocks_unsupported.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -1045,3 +1070,434 @@ def test_that_openrouter_generator_supports_correct_parameters(container: Contai
 
     expected_params = ["temperature", "max_tokens"]
     assert generator.supported_openrouter_params == expected_params
+
+
+# --- Prompt caching ----------------------------------------------------------
+
+
+async def test_that_prompt_cache_splits_user_content_into_prefix_and_tail_blocks_at_first_dynamic_section(
+    container: Container,
+) -> None:
+    """The stable leading sections become a cached content block; the first dynamic
+    section onward becomes a separate, uncached block."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.AGENT_IDENTITY, "Agent: Bob"),
+            (BuiltInSection.INTERACTION_HISTORY, "User: hello"),
+            ("output-format", "Respond with JSON."),
+        ]
+    )
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(builder)
+
+    content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert len(content) == 2
+    assert content[0]["type"] == "text"
+    assert content[0]["cache_control"] == {"type": "ephemeral"}
+    assert content[1]["type"] == "text"
+    assert "cache_control" not in content[1]
+
+
+async def test_that_prompt_cache_blocks_concatenate_to_exactly_the_built_prompt(
+    container: Container,
+) -> None:
+    """Splitting must not alter the prompt: joining the block texts reproduces build()."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.AGENT_IDENTITY, "Agent: Bob"),
+            (BuiltInSection.INTERACTION_HISTORY, "User: hello"),
+            ("output-format", "Respond with JSON."),
+        ]
+    )
+    built = builder.build()
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(builder)
+
+    content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert "".join(block["text"] for block in content) == built
+
+
+async def test_that_prompt_cache_is_skipped_and_sends_plain_string_for_raw_string_prompt(
+    container: Container,
+) -> None:
+    """A raw string prompt carries no section structure, so no split is attempted."""
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(_LARGE_STATIC_PREFIX)
+
+    content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert isinstance(content, str)
+
+
+async def test_that_prompt_cache_is_skipped_when_no_dynamic_section_is_present(
+    container: Container,
+) -> None:
+    """With no per-turn section there is no hot/cold boundary; send a plain string."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.AGENT_IDENTITY, "Agent: Bob"),
+            (BuiltInSection.CUSTOMER_IDENTITY, "Customer: Alice"),
+        ]
+    )
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(builder)
+
+    content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert isinstance(content, str)
+
+
+async def test_that_prompt_cache_is_skipped_when_first_section_is_dynamic(
+    container: Container,
+) -> None:
+    """If the very first section is dynamic there is no stable prefix to cache."""
+    builder = _make_prompt_builder(
+        [
+            (BuiltInSection.INTERACTION_HISTORY, _LARGE_STATIC_PREFIX),
+            ("output-format", "Respond with JSON."),
+        ]
+    )
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(builder)
+
+    content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert isinstance(content, str)
+
+
+async def test_that_prompt_cache_is_skipped_when_stable_prefix_is_below_min_size(
+    container: Container,
+) -> None:
+    """A prefix below the provider cache minimum is not worth a breakpoint; send plain text."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _SMALL_STATIC_PREFIX),
+            (BuiltInSection.INTERACTION_HISTORY, "User: hello"),
+        ]
+    )
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(builder)
+
+    content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert isinstance(content, str)
+
+
+async def test_that_prompt_cache_is_disabled_via_OPENROUTER_PROMPT_CACHE_false(
+    container: Container,
+) -> None:
+    """OPENROUTER_PROMPT_CACHE=false forces the legacy flat-string behavior."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.INTERACTION_HISTORY, "User: hello"),
+        ]
+    )
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "false"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(builder)
+
+    content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert isinstance(content, str)
+
+
+async def test_that_prompt_cache_breakpoint_is_present_in_json_schema_mode(
+    container: Container,
+) -> None:
+    """The cache breakpoint coexists with json_schema response_format and provider params."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.INTERACTION_HISTORY, "User: hello"),
+        ]
+    )
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(builder)
+
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["response_format"]["type"] == "json_schema"
+    assert call_kwargs["extra_body"] == {"provider": {"require_parameters": True}}
+    content = call_kwargs["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0]["cache_control"] == {"type": "ephemeral"}
+
+
+async def test_that_prompt_cache_breakpoint_is_present_in_json_object_mode(
+    container: Container,
+) -> None:
+    """The cache breakpoint survives demotion to json_object mode."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.INTERACTION_HISTORY, "User: hello"),
+        ]
+    )
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        generator._response_format_mode = "json_object"
+        await generator.do_generate(builder)
+
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["response_format"]["type"] == "json_object"
+    content = call_kwargs["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0]["cache_control"] == {"type": "ephemeral"}
+
+
+async def test_that_prompt_cache_breakpoint_user_message_is_a_block_list_in_plain_mode(
+    container: Container,
+) -> None:
+    """In plain mode the short system message stays a string; only the user content is split."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.INTERACTION_HISTORY, "User: hello"),
+        ]
+    )
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        generator._response_format_mode = "plain"
+        await generator.do_generate(builder)
+
+    messages = mock_client.chat.completions.create.call_args.kwargs["messages"]
+    assert messages[0]["role"] == "system"
+    assert isinstance(messages[0]["content"], str)
+    assert messages[1]["role"] == "user"
+    assert isinstance(messages[1]["content"], list)
+    assert messages[1]["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+async def test_that_prompt_cache_ttl_is_forwarded_to_cache_control_when_OPENROUTER_PROMPT_CACHE_TTL_set(
+    container: Container,
+) -> None:
+    """OPENROUTER_PROMPT_CACHE_TTL is forwarded into the cache_control breakpoint."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.INTERACTION_HISTORY, "User: hello"),
+        ]
+    )
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(
+            os.environ,
+            {"OPENROUTER_PROMPT_CACHE": "true", "OPENROUTER_PROMPT_CACHE_TTL": "1h"},
+            clear=False,
+        ),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(builder)
+
+    content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert content[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+async def test_that_prompt_cache_falls_back_to_plain_string_when_provider_rejects_content_blocks(
+    container: Container,
+) -> None:
+    """If a provider rejects the content-block shape (non-format BadRequestError), retry with a
+    plain string and memoize the model so later requests skip the blocks entirely."""
+    rejection = BadRequestError(
+        "Provider rejected request: content blocks are not supported",
+        response=Mock(),
+        body=None,
+    )
+    responses = [
+        _make_chat_response(
+            '{"test_field": "first"}',
+            CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        ),
+        _make_chat_response(
+            '{"test_field": "second"}',
+            CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        ),
+    ]
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(
+            container,
+            create_side_effect=[rejection, responses[0], responses[1]],
+            model_name="google/gemini-3-flash-preview",
+        ) as (generator, mock_client),
+    ):
+        first = await generator.do_generate(
+            _make_prompt_builder(
+                [
+                    ("instructions", _LARGE_STATIC_PREFIX),
+                    (BuiltInSection.INTERACTION_HISTORY, "User: one"),
+                ]
+            )
+        )
+        second = await generator.do_generate(
+            _make_prompt_builder(
+                [
+                    ("instructions", _LARGE_STATIC_PREFIX),
+                    (BuiltInSection.INTERACTION_HISTORY, "User: two"),
+                ]
+            )
+        )
+
+    assert first.content.test_field == "first"
+    assert second.content.test_field == "second"
+
+    calls = mock_client.chat.completions.create.call_args_list
+    assert len(calls) == 3
+    # First attempt sent content blocks; it was rejected.
+    assert isinstance(calls[0].kwargs["messages"][0]["content"], list)
+    # The retry dropped the blocks back to a plain string.
+    assert isinstance(calls[1].kwargs["messages"][0]["content"], str)
+    # The model is memoized as block-incompatible, so the next request skips blocks.
+    assert isinstance(calls[2].kwargs["messages"][0]["content"], str)
+
+
+async def test_that_prompt_cache_does_not_fall_back_or_memoize_on_an_unrelated_bad_request(
+    container: Container,
+) -> None:
+    """An unrelated 400 (quota, bad slug, malformed schema) raised while sending content
+    blocks must propagate as-is, without retrying as a plain string or marking the model
+    cache-incompatible — otherwise a transient error would permanently disable caching."""
+    unrelated = BadRequestError(
+        "You have exceeded your quota for this billing period.",
+        response=Mock(),
+        body=None,
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(
+            container,
+            create_side_effect=[unrelated],
+            model_name="google/gemini-3-flash-preview",
+        ) as (generator, mock_client),
+    ):
+        with pytest.raises(BadRequestError):
+            await generator.do_generate(
+                _make_prompt_builder(
+                    [
+                        ("instructions", _LARGE_STATIC_PREFIX),
+                        (BuiltInSection.INTERACTION_HISTORY, "User: one"),
+                    ]
+                )
+            )
+
+        # No plain-string retry: the single attempt sent content blocks and raised.
+        calls = mock_client.chat.completions.create.call_args_list
+        assert len(calls) == 1
+        assert isinstance(calls[0].kwargs["messages"][0]["content"], list)
+        # The model must NOT be memoized as cache-incompatible.
+        assert "google/gemini-3-flash-preview" not in generator._cache_blocks_unsupported
