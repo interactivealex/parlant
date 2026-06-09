@@ -193,13 +193,17 @@ def _split_prompt_for_caching(
     min_prefix_chars: int,
 ) -> list[_ContentBlock] | None:
     """Split an already-built prompt into a cached stable-prefix block and an
-    uncached variable-tail block, or return None when no worthwhile split exists.
+    uncached variable-tail block, or return None when no worthwhile (or safe) split
+    exists.
 
     *built* is ``prompt.build()``'s output, passed in so the full prompt is
     rendered only once. The breakpoint is placed before the first per-turn
     (dynamic) section; only the leading prefix sections are re-rendered, to locate
-    the cut point. The two block texts concatenate to exactly *built*, so the
-    prompt the model receives is byte-for-byte unchanged.
+    the cut point. The returned block texts concatenate to exactly *built*, so the
+    prompt the model receives is byte-for-byte unchanged. When the dynamic tail is
+    empty this turn the whole prompt is returned as a single cached block; when the
+    re-rendered prefix cannot be reconciled with *built*, None is returned so the
+    caller falls back to a flat prompt rather than risk corrupting it.
     """
     items = list(prompt.sections.items())
 
@@ -213,8 +217,10 @@ def _split_prompt_for_caching(
         return None
 
     # Re-render only the prefix sections to find where the cacheable prefix ends in
-    # `built`. build() joins sections with "\n\n" then strips, so this lstripped
-    # join is a true prefix of `built` and the slice below reproduces it exactly.
+    # `built`. build() concatenates every section as `render + "\n\n"` then strips
+    # the whole prompt; this lstripped join mirrors that buffer for the prefix. The
+    # reconciliation below handles the cases where build()'s trailing strip makes the
+    # two diverge.
     prefix_text = (
         "\n\n".join(
             section.template.format(**section.props) for _, section in items[:first_dynamic]
@@ -224,11 +230,24 @@ def _split_prompt_for_caching(
     if len(prefix_text) < min_prefix_chars:
         return None
 
-    # The re-rendered prefix must be a literal prefix of `built`; otherwise the
-    # slice below would silently corrupt the prompt. This holds as long as section
-    # rendering is deterministic (no per-call state in template.format), so guard it.
-    assert built.startswith(prefix_text), "cache prefix is not a prefix of the built prompt"
-    suffix_text = built[len(prefix_text) :]
+    # Normally `built` starts with the reconstructed prefix and the tail is the rest.
+    # Two cases break that, and neither may corrupt the prompt or crash the turn:
+    #
+    #  1. Every section from the first dynamic one onward rendered to whitespace. Then
+    #     build()'s trailing .strip() trimmed the prefix's own trailing "\n\n", so
+    #     `built` equals the whitespace-stripped prefix. There is no per-turn content
+    #     this turn, so the whole prompt is stable and is cached as a single block.
+    #  2. A section rendered non-deterministically (different bytes than during
+    #     build()). The reconstructed prefix is then unrelated to `built`; degrade to
+    #     a flat prompt rather than slice `built` at a meaningless offset. Caching is
+    #     an optimization, never worth corrupting a prompt or crashing a turn.
+    if built.startswith(prefix_text):
+        suffix_text = built[len(prefix_text) :]
+    elif built == prefix_text.rstrip():
+        prefix_text = built
+        suffix_text = ""
+    else:
+        return None
 
     # {"type": "ephemeral"} is the standard breakpoint; the optional "ttl" (e.g.
     # "1h") is honored by OpenRouter and Anthropic's extended-TTL cache. Providers
@@ -237,10 +256,14 @@ def _split_prompt_for_caching(
     if ttl:
         cache_control["ttl"] = ttl
 
-    return [
+    # The prefix carries the cache breakpoint; the variable tail, when present, is a
+    # second uncached block. The block texts concatenate to exactly `built`.
+    blocks: list[_ContentBlock] = [
         {"type": "text", "text": prefix_text, "cache_control": cache_control},
-        {"type": "text", "text": suffix_text},
     ]
+    if suffix_text:
+        blocks.append({"type": "text", "text": suffix_text})
+    return blocks
 
 
 class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):

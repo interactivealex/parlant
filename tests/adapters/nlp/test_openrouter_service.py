@@ -35,6 +35,8 @@ from parlant.adapters.nlp.openrouter_service import (  # type: ignore[reportMiss
     OpenRouterClaudeSonnet46,
     OpenRouterLlama33_70B,
     OpenRouterEstimatingTokenizer,
+    _MIN_CACHE_PREFIX_CHARS,
+    _split_prompt_for_caching,
 )
 from parlant.core.loggers import Logger
 from parlant.core.common import DefaultBaseModel
@@ -1154,6 +1156,100 @@ async def test_that_prompt_cache_blocks_concatenate_to_exactly_the_built_prompt(
 
     content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
     assert "".join(block["text"] for block in content) == built
+
+
+async def test_that_prompt_cache_does_not_crash_when_all_dynamic_sections_render_empty(
+    container: Container,
+) -> None:
+    """When every section from the first dynamic one onward renders to whitespace,
+    build()'s trailing .strip() trims the stable prefix's own trailing "\\n\\n"
+    separator. The reconstructed prefix then is not a literal prefix of the built
+    prompt. The turn must still complete and the model must receive build() verbatim,
+    never a corrupted or truncated prompt (and never an AssertionError)."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.AGENT_IDENTITY, "Agent: Bob"),
+            (BuiltInSection.INTERACTION_HISTORY, ""),
+            (BuiltInSection.GUIDELINES, ""),
+        ]
+    )
+    built = builder.build()
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(builder)
+
+    content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    sent = "".join(block["text"] for block in content) if isinstance(content, list) else content
+    assert sent == built
+
+
+async def test_that_prompt_cache_caches_whole_prompt_as_single_block_when_dynamic_suffix_is_whitespace(
+    container: Container,
+) -> None:
+    """With no per-turn content this turn (the dynamic suffix is whitespace only), the
+    whole built prompt is stable and is cached as a single content block whose text is
+    exactly build()'s output."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.INTERACTION_HISTORY, "   \n  "),
+        ]
+    )
+    built = builder.build()
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(builder)
+
+    content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert len(content) == 1
+    assert content[0]["type"] == "text"
+    assert content[0]["cache_control"] == {"type": "ephemeral"}
+    assert content[0]["text"] == built
+
+
+def test_that_prompt_cache_returns_none_when_rerendered_prefix_is_not_a_prefix_of_built() -> None:
+    """Defense in depth: if the re-rendered prefix is neither a prefix of `built` nor
+    its whitespace-trimmed form (e.g. a section rendered non-deterministically), the
+    split degrades to None (a flat prompt) rather than corrupting the prompt or
+    asserting. Caching is an optimization, never worth crashing a turn."""
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.INTERACTION_HISTORY, "User: hello"),
+        ]
+    )
+    built = builder.build()
+    # Corrupt the first character so the re-rendered prefix can no longer be a prefix
+    # of `built`, simulating a divergence between build() and the split's re-render.
+    tampered = "X" + built[1:]
+
+    result = _split_prompt_for_caching(
+        builder, tampered, ttl=None, min_prefix_chars=_MIN_CACHE_PREFIX_CHARS
+    )
+
+    assert result is None
 
 
 async def test_that_prompt_cache_is_skipped_and_sends_plain_string_for_raw_string_prompt(
