@@ -257,6 +257,16 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
     # for the rest of the process, avoiding a wasted round-trip on every request.
     _cache_blocks_unsupported: ClassVar[set[str]] = set()
 
+    # Safe defaults so a subclass that overrides __init__ without chaining up
+    # (e.g. to swap the client base URL) still reads these without AttributeError.
+    # __init__ overwrites both with the env-driven values; the defaults only ever
+    # govern a bypassing subclass, which degrades to caching-off, never a crash.
+    # Plain instance annotations (not ClassVar): unlike the genuinely class-shared
+    # _response_format_modes / _cache_blocks_unsupported above, these are per-instance
+    # config, so __init__'s `self.` assignment must not trip "assign to ClassVar".
+    _prompt_caching_enabled: bool = False
+    _cache_ttl: str | None = None
+
     def __init__(
         self,
         model_name: str,

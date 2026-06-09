@@ -329,6 +329,20 @@ def test_that_openrouter_generator_honors_custom_base_url(mock_client_class: Moc
         )
 
 
+def test_that_prompt_cache_attrs_have_safe_class_defaults() -> None:
+    """A subclass that overrides __init__ without chaining up (e.g. to swap the
+    client base URL) must still read the prompt-cache attrs _do_generate touches.
+    Class-level defaults guarantee caching-off instead of AttributeError."""
+
+    class _BypassingGenerator(OpenRouterSchematicGenerator[SchemaData]):
+        def __init__(self) -> None:  # deliberately skips super().__init__
+            pass
+
+    gen = _BypassingGenerator()
+    assert gen._prompt_caching_enabled is False
+    assert gen._cache_ttl is None
+
+
 @patch("parlant.adapters.nlp.openrouter_service.AsyncClient")
 def test_that_openrouter_generator_without_custom_headers(mock_client_class: Mock) -> None:
     """Test OpenRouter generator without custom headers."""
