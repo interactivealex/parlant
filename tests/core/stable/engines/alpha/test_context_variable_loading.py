@@ -224,3 +224,41 @@ async def test_that_value_is_created_when_need_to_be_freshed(
         key=test_key,
     )
     assert stored_value == created_value
+
+
+async def test_that_parallel_variable_loading_preserves_variable_order_and_key_priority() -> None:
+    """_load_context_variables gathers variables concurrently; the result must keep
+    the input variable order, and each variable must still resolve its highest-
+    priority key (customer > tag > global) exactly like the sequential loop."""
+    from unittest.mock import AsyncMock, Mock
+
+    from parlant.core.engines.alpha.engine import AlphaEngine
+
+    engine = object.__new__(AlphaEngine)
+
+    variables = [Mock(id=f"var-{i}", name=f"v{i}") for i in range(5)]
+    engine._entity_queries = Mock(
+        find_context_variables_for_context=AsyncMock(return_value=variables)
+    )
+
+    # var-0 resolves on the customer key, var-2 on the global key, others never.
+    async def load_value(context, variable, key):
+        if variable.id == "var-0" and key == "customer-1":
+            return "customer-value"
+        if variable.id == "var-2":
+            return "global-value" if key == ContextVariableStore.GLOBAL_KEY else None
+        return None
+
+    engine._load_context_variable_value = AsyncMock(side_effect=load_value)
+
+    context = Mock()
+    context.agent.id = "agent-1"
+    context.customer.id = "customer-1"
+    context.customer.tags = []
+
+    result = await AlphaEngine._load_context_variables(engine, context)
+
+    assert [(v.id, value) for v, value in result] == [
+        ("var-0", "customer-value"),
+        ("var-2", "global-value"),
+    ]

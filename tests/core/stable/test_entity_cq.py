@@ -656,3 +656,46 @@ async def test_that_find_guidelines_that_need_reevaluation_finds_guidelines_by_t
 
     assert len(result) == 1
     assert result[0].id == guideline.id
+
+
+async def test_that_concurrent_journey_related_guideline_lookups_accumulate_shared_dependencies(
+    container: Container,
+) -> None:
+    """find_journey_related_guidelines is gathered concurrently by the engine; a
+    guideline depending on two journeys must end up associated with both."""
+    from parlant.core import async_utils
+
+    entity_queries = container[EntityQueries]
+    guideline_store = container[GuidelineStore]
+    journey_store = container[JourneyStore]
+    relationship_store = container[RelationshipStore]
+
+    journey_a = await journey_store.create_journey(
+        title="Journey A", description="first", conditions=[]
+    )
+    journey_b = await journey_store.create_journey(
+        title="Journey B", description="second", conditions=[]
+    )
+    shared_guideline = await guideline_store.create_guideline(
+        condition="condition", action="action"
+    )
+
+    for journey in (journey_a, journey_b):
+        await relationship_store.create_relationship(
+            source=RelationshipEntity(
+                id=shared_guideline.id, kind=RelationshipEntityKind.GUIDELINE
+            ),
+            target=RelationshipEntity(
+                id=Tag.for_journey_id(journey.id).id, kind=RelationshipEntityKind.TAG_ALL
+            ),
+            kind=RelationshipKind.DEPENDENCY,
+        )
+
+    results = await async_utils.safe_gather(
+        entity_queries.find_journey_related_guidelines(journey_a),
+        entity_queries.find_journey_related_guidelines(journey_b),
+    )
+
+    assert all(shared_guideline.id in r for r in results)
+    dependents = entity_queries.guideline_and_journeys_it_depends_on[shared_guideline.id]
+    assert {j.id for j in dependents} == {journey_a.id, journey_b.id}

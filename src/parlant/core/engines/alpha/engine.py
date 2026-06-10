@@ -1096,26 +1096,34 @@ class AlphaEngine(Engine):
             )
         )
 
-        result = []
-
         keys_to_check_in_order_of_importance = (
             [context.customer.id]  # Customer-specific value
             + [f"tag:{tag_id}" for tag_id in context.customer.tags]  # Tag-specific value
             + [ContextVariableStore.GLOBAL_KEY]  # Global value
         )
 
-        # TODO: Parallelize this, as some tool-enabled context vars
-        # might run long-running tasks. One example we've encountered
-        # is analyzing an image and putting the analysis into a variable.
-        for variable in variables_supported_by_agent:
-            # Try keys in order of importance, stopping at and using
-            # the first (and most important) set key for each variable.
-            for key in keys_to_check_in_order_of_importance:
-                if value := await self._load_context_variable_value(context, variable, key):
-                    result.append((variable, value))
-                    break
+        # Tool-enabled context vars can run long tasks (e.g. analyzing an image
+        # into a variable), so variables load concurrently. The semaphore bounds
+        # the burst against external tool services; per variable, keys are still
+        # tried strictly in order of importance, stopping at the first set key.
+        semaphore = asyncio.Semaphore(8)
 
-        return result
+        async def load_variable(
+            variable: ContextVariable,
+        ) -> Optional[tuple[ContextVariable, ContextVariableValue]]:
+            async with semaphore:
+                for key in keys_to_check_in_order_of_importance:
+                    if value := await self._load_context_variable_value(context, variable, key):
+                        return (variable, value)
+            return None
+
+        loaded = await async_utils.safe_gather(
+            *(load_variable(v) for v in variables_supported_by_agent)
+        )
+
+        # Gather preserves input order, so the result keeps the order of
+        # variables_supported_by_agent exactly like the sequential loop did.
+        return [entry for entry in loaded if entry is not None]
 
     async def _capture_tool_preexecution_state(
         self, context: EngineContext
@@ -1702,11 +1710,16 @@ class AlphaEngine(Engine):
             high_prob_journeys = sorted_journeys_by_relevance[:top_k]
 
         # Build a single cache of guideline IDs per journey for all available journeys.
-        journey_to_guideline_ids: dict[JourneyId, set[GuidelineId]] = {}
-        for journey in available_journeys:
-            journey_to_guideline_ids[journey.id] = set(
-                await self._entity_queries.find_journey_related_guidelines(journey)
+        related_per_journey = await async_utils.safe_gather(
+            *(
+                self._entity_queries.find_journey_related_guidelines(journey)
+                for journey in available_journeys
             )
+        )
+        journey_to_guideline_ids: dict[JourneyId, set[GuidelineId]] = {
+            journey.id: set(related)
+            for journey, related in zip(available_journeys, related_per_journey)
+        }
 
         # All guideline IDs that are tied to any *available* journey.
         available_journeys_related_ids: set[GuidelineId] = (
@@ -1736,16 +1749,15 @@ class AlphaEngine(Engine):
         high_prob_journeys: Sequence[Journey],
         activated_journeys: Sequence[Journey],
     ) -> Optional[GuidelineMatchingResult]:
+        low_prob_journeys = [j for j in activated_journeys if j not in high_prob_journeys]
         activated_low_prob_related_ids = set(
             chain.from_iterable(
-                [
-                    await self._entity_queries.find_journey_related_guidelines(j)
-                    for j in [
-                        activated_journey
-                        for activated_journey in activated_journeys
-                        if activated_journey not in high_prob_journeys
-                    ]
-                ]
+                await async_utils.safe_gather(
+                    *(
+                        self._entity_queries.find_journey_related_guidelines(j)
+                        for j in low_prob_journeys
+                    )
+                )
             )
         )
 
@@ -1780,10 +1792,12 @@ class AlphaEngine(Engine):
     ) -> Optional[GuidelineMatchingResult]:
         related_guidelines = list(
             chain.from_iterable(
-                [
-                    await self._entity_queries.find_journey_related_guidelines(j)
-                    for j in [activated_journey for activated_journey in activated_journeys]
-                ]
+                await async_utils.safe_gather(
+                    *(
+                        self._entity_queries.find_journey_related_guidelines(j)
+                        for j in activated_journeys
+                    )
+                )
             )
         )
 

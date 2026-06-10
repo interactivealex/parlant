@@ -38,7 +38,11 @@ from pydantic import ValidationError
 import tiktoken
 
 from parlant.adapters.nlp.common import normalize_json_output, record_llm_metrics
-from parlant.core.engines.alpha.prompt_builder import BuiltInSection, PromptBuilder
+from parlant.core.engines.alpha.prompt_builder import (
+    BuiltInSection,
+    PromptBuilder,
+    render_section,
+)
 from parlant.core.loggers import Logger
 from parlant.core.meter import Meter
 from parlant.core.nlp.policies import policy, retry
@@ -143,11 +147,21 @@ _ContentBlock = dict[str, Any]
 # overhead without ever producing a cache hit.
 _MIN_CACHE_PREFIX_CHARS = 4096
 
+# Once-per-process-per-model log dedup (mirrors the _cache_blocks_unsupported
+# memoization pattern). A prefix divergence means caching silently degrades to a
+# flat prompt on every turn — that must be visible to operators, but exactly
+# once, not per generation. The two INFO sets give a positive deployment signal
+# that the split fired and that the provider actually reported cache hits.
+_split_divergence_warned: set[str] = set()
+_cache_split_logged: set[str] = set()
+_cache_hit_logged: set[str] = set()
+
 # PromptBuilder sections whose rendered content can change from one turn to the
 # next. The cacheable prefix is the contiguous run of sections *before* the first
 # of these. Only AGENT_IDENTITY / CUSTOMER_IDENTITY and custom (string-keyed)
-# instruction sections are treated as stable; unknown BuiltInSection members
-# default to stable, so any new per-turn section must be added here.
+# instruction sections are treated as stable; every BuiltInSection member must be
+# placed in exactly one of the two sets below — the asserts after them enforce
+# coverage at import time.
 _DYNAMIC_SECTIONS: frozenset[BuiltInSection] = frozenset(
     {
         BuiltInSection.CONTEXT_VARIABLES,
@@ -191,6 +205,8 @@ def _split_prompt_for_caching(
     *,
     ttl: str | None,
     min_prefix_chars: int,
+    logger: Logger | None = None,
+    model_name: str | None = None,
 ) -> list[_ContentBlock] | None:
     """Split an already-built prompt into a cached stable-prefix block and an
     uncached variable-tail block, or return None when no worthwhile (or safe) split
@@ -217,13 +233,14 @@ def _split_prompt_for_caching(
         return None
 
     # Re-render only the prefix sections to find where the cacheable prefix ends in
-    # `built`. build() concatenates every section as `render + "\n\n"` then strips
-    # the whole prompt; this lstripped join mirrors that buffer for the prefix. The
-    # reconciliation below handles the cases where build()'s trailing strip makes the
-    # two diverge.
+    # `built`. render_section is the same function build() uses, so the prefix is
+    # byte-identical to its slice of `built` by construction. build() concatenates
+    # every section as `render + "\n\n"` then strips the whole prompt; this
+    # lstripped join mirrors that buffer for the prefix. The reconciliation below
+    # handles the cases where build()'s trailing strip makes the two diverge.
     prefix_text = (
         "\n\n".join(
-            section.template.format(**section.props) for _, section in items[:first_dynamic]
+            render_section(section.template, section.props) for _, section in items[:first_dynamic]
         )
         + "\n\n"
     ).lstrip()
@@ -247,6 +264,17 @@ def _split_prompt_for_caching(
         prefix_text = built
         suffix_text = ""
     else:
+        # Divergence means a permanent silent cache miss for this prompt shape;
+        # surface it once per model so operators can tell "caching off" apart
+        # from "caching working".
+        if logger is not None and (model_name or "") not in _split_divergence_warned:
+            _split_divergence_warned.add(model_name or "")
+            logger.warning(
+                f"Prompt cache: stable-prefix re-render diverged from built prompt"
+                f" for model '{model_name}'; falling back to a flat (uncached)"
+                f" prompt. This indicates a non-deterministically rendering"
+                f" section. Warned once; subsequent divergences are silent."
+            )
         return None
 
     # {"type": "ephemeral"} is the standard breakpoint; the optional "ttl" (e.g.
@@ -590,7 +618,15 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
                     prompt,
                     ttl=self._cache_ttl,
                     min_prefix_chars=_MIN_CACHE_PREFIX_CHARS,
+                    logger=self.logger,
+                    model_name=self.model_name,
                 )
+                if message_content is not None and self.model_name not in _cache_split_logged:
+                    _cache_split_logged.add(self.model_name)
+                    self.logger.info(
+                        f"Prompt cache: first cache split produced for model"
+                        f" '{self.model_name}' ({len(message_content[0]['text'])} prefix chars)."
+                    )
 
         openrouter_api_arguments = {
             k: v for k, v in hints.items() if k in self.supported_openrouter_params
@@ -654,6 +690,13 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
         input_tokens = (usage.prompt_tokens or 0) if usage else 0
         output_tokens = (usage.completion_tokens or 0) if usage else 0
         cached_input_tokens = _extract_cached_input_tokens(usage)
+
+        if cached_input_tokens > 0 and self.model_name not in _cache_hit_logged:
+            _cache_hit_logged.add(self.model_name)
+            self.logger.info(
+                f"Prompt cache HIT active: model '{self.model_name}' reported"
+                f" {cached_input_tokens} cached input tokens."
+            )
 
         await record_llm_metrics(
             self.meter,

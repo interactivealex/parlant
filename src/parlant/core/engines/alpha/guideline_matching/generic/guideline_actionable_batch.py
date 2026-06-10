@@ -97,16 +97,16 @@ class GenericActionableGuidelineMatchingBatch(GuidelineMatchingBatch):
         async with measure_guideline_matching_batch(self._meter, self):
             prompt = self._build_prompt(shots=await self.shots())
 
-            try:
-                generation_attempt_temperatures = (
-                    self._optimization_policy.get_guideline_matching_batch_retry_temperatures(
-                        hints={"type": self.__class__.__name__}
-                    )
+            generation_attempt_temperatures = (
+                self._optimization_policy.get_guideline_matching_batch_retry_temperatures(
+                    hints={"type": self.__class__.__name__}
                 )
+            )
 
-                last_generation_exception: Exception | None = None
+            last_generation_exception: Exception | None = None
 
-                for generation_attempt in range(3):
+            for generation_attempt in range(3):
+                try:
                     inference = await self._schematic_generator.generate(
                         prompt=prompt,
                         hints={"temperature": generation_attempt_temperatures[generation_attempt]},
@@ -142,14 +142,14 @@ class GenericActionableGuidelineMatchingBatch(GuidelineMatchingBatch):
                         generation_info=inference.info,
                     )
 
-            except Exception as exc:
-                self._logger.warning(
-                    f"Attempt {generation_attempt} failed: {traceback.format_exception(exc)}"
-                )
+                except Exception as exc:
+                    self._logger.warning(
+                        f"Attempt {generation_attempt} failed: {traceback.format_exception(exc)}"
+                    )
 
-                last_generation_exception = exc
+                    last_generation_exception = exc
 
-        raise GuidelineMatchingBatchError() from last_generation_exception
+            raise GuidelineMatchingBatchError() from last_generation_exception
 
     async def shots(self) -> Sequence[GenericActionableGuidelineGuidelineMatchingShot]:
         return await shot_collection.list()

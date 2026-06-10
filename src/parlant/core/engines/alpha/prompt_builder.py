@@ -53,6 +53,102 @@ from parlant.core.tools import ToolId
 _T = TypeVar("_T")
 
 
+def render_section(template: str, props: dict[str, Any]) -> str:
+    """Render a prompt-section template against its props.
+
+    This is the single render path for prompt sections: ``PromptBuilder.build()``
+    and any consumer that re-renders sections (e.g. the OpenRouter adapter's
+    prompt-cache prefix split) MUST both use it, so their outputs are
+    byte-identical by construction.
+
+    Semantics are ``str.format`` for well-formed templates (the fast path *is*
+    ``str.format``), with leniency where ``str.format`` raises: section content
+    routinely embeds LLM- or customer-authored text (guideline rationales,
+    personas, tool output) whose literal braces must never crash a turn.
+
+    - ``{{`` / ``}}`` collapse to ``{`` / ``}`` exactly like ``str.format``.
+    - ``{key}`` (optionally with ``!conv`` / ``:spec``) renders when ``key`` is
+      in *props*; unknown keys are left verbatim, placeholder intact.
+    - Stray unmatched ``{`` or ``}`` are left verbatim.
+    - Never raises on arbitrary template content.
+
+    Limitation: ``{obj.attr}`` / ``{seq[0]}`` traversal is resolved only on the
+    fast path; on the lenient path such placeholders are left verbatim (no
+    template in this codebase uses them).
+    """
+    try:
+        return template.format(**props)
+    except (KeyError, ValueError, IndexError):
+        pass
+
+    result: list[str] = []
+    i = 0
+    n = len(template)
+
+    while i < n:
+        c = template[i]
+
+        if c == "{":
+            if i + 1 < n and template[i + 1] == "{":
+                result.append("{")
+                i += 2
+                continue
+
+            j = template.find("}", i + 1)
+            if j == -1:
+                result.append("{")
+                i += 1
+                continue
+
+            field_expr = template[i + 1 : j]
+
+            conversion: str | None = None
+            format_spec = ""
+            colon = field_expr.find(":")
+            bang = field_expr.find("!")
+
+            if bang >= 0 and (colon < 0 or bang < colon):
+                key = field_expr[:bang]
+                after_bang = field_expr[bang + 1 :]
+                conversion = after_bang[0] if after_bang else None
+                rest = after_bang[1:] if conversion else after_bang
+                format_spec = rest[1:] if rest.startswith(":") else ""
+            elif colon >= 0:
+                key = field_expr[:colon]
+                format_spec = field_expr[colon + 1 :]
+            else:
+                key = field_expr
+
+            base_key = key.split("[")[0].split(".")[0]
+
+            if base_key == key and key in props:
+                val: Any = props[key]
+                if conversion == "r":
+                    val = repr(val)
+                elif conversion == "s":
+                    val = str(val)
+                elif conversion == "a":
+                    val = ascii(val)
+                result.append(format(val, format_spec) if format_spec else str(val))
+            else:
+                result.append(template[i : j + 1])
+
+            i = j + 1
+
+        elif c == "}":
+            if i + 1 < n and template[i + 1] == "}":
+                result.append("}")
+                i += 2
+            else:
+                result.append("}")
+                i += 1
+        else:
+            result.append(c)
+            i += 1
+
+    return "".join(result)
+
+
 class BuiltInSection(str, Enum):
     @staticmethod
     def _generate_next_value_(name: str, start: int, count: int, last_values: list[str]) -> str:
@@ -151,7 +247,7 @@ class PromptBuilder:
 
         for section_name, section in self.sections.items():
             try:
-                buffer.write(section.template.format(**section.props))
+                buffer.write(render_section(section.template, section.props))
                 buffer.write("\n\n")
             except Exception as e:
                 raise ValueError(

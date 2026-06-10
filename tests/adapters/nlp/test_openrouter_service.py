@@ -1611,3 +1611,104 @@ async def test_that_prompt_cache_does_not_fall_back_or_memoize_on_an_unrelated_b
         assert isinstance(calls[0].kwargs["messages"][0]["content"], list)
         # The model must NOT be memoized as cache-incompatible.
         assert "google/gemini-3-flash-preview" not in generator._cache_blocks_unsupported
+
+
+# --- Render-path unification (render_section shared by build() and the split) --
+
+
+def test_that_prompt_cache_split_succeeds_when_stable_prefix_has_double_brace_escape() -> None:
+    """A `{{`-escaped JSON example inside a stable-prefix section must not break the
+    split: build() and the prefix re-render share render_section, so both collapse
+    `{{` to `{` identically and the blocks concatenate to exactly build()'s output."""
+    builder = PromptBuilder()
+    builder.add_section("instructions", _LARGE_STATIC_PREFIX)
+    builder.add_section(
+        "initial-message-instructions",
+        'If you decide not to reply, output:\n{{\n    "produced_reply": false\n}}',
+    )
+    builder.add_section(BuiltInSection.INTERACTION_HISTORY, "User: hello")
+    built = builder.build()
+    assert '{\n    "produced_reply": false\n}' in built
+
+    result = _split_prompt_for_caching(
+        builder, built, ttl=None, min_prefix_chars=_MIN_CACHE_PREFIX_CHARS
+    )
+
+    assert result is not None
+    assert "".join(block["text"] for block in result) == built
+
+
+def test_that_prompt_cache_split_succeeds_when_stable_prefix_template_has_stray_braces() -> None:
+    """LLM/customer-authored text with bare braces in a stable section template must
+    neither crash the split nor diverge from build()."""
+    builder = PromptBuilder()
+    builder.add_section("instructions", _LARGE_STATIC_PREFIX)
+    builder.add_section(
+        "guideline-rationale",
+        "when asked, then reply 'has_account': {'value': false}",
+    )
+    builder.add_section(BuiltInSection.INTERACTION_HISTORY, "User: hello")
+    built = builder.build()
+
+    result = _split_prompt_for_caching(
+        builder, built, ttl=None, min_prefix_chars=_MIN_CACHE_PREFIX_CHARS
+    )
+
+    assert result is not None
+    assert "".join(block["text"] for block in result) == built
+
+
+def test_that_prompt_cache_split_succeeds_when_stable_prefix_prop_value_has_braces() -> None:
+    """Brace-containing prop VALUES (e.g. a persona with JSON snippets) render
+    identically in build() and the split's re-render."""
+    builder = PromptBuilder()
+    builder.add_section("instructions", _LARGE_STATIC_PREFIX)
+    builder.add_section(
+        BuiltInSection.AGENT_IDENTITY,
+        "{agent_description}",
+        props={"agent_description": 'persona with JSON: {"tone": "calm"}'},
+    )
+    builder.add_section(BuiltInSection.INTERACTION_HISTORY, "User: hello")
+    built = builder.build()
+    assert '{"tone": "calm"}' in built
+
+    result = _split_prompt_for_caching(
+        builder, built, ttl=None, min_prefix_chars=_MIN_CACHE_PREFIX_CHARS
+    )
+
+    assert result is not None
+    assert "".join(block["text"] for block in result) == built
+
+
+def test_that_prompt_cache_divergence_warns_exactly_once_per_model() -> None:
+    """The divergence fallback must be observable: one WARNING per model per
+    process, then silent."""
+    from parlant.adapters.nlp import openrouter_service as ors
+
+    builder = _make_prompt_builder(
+        [
+            ("instructions", _LARGE_STATIC_PREFIX),
+            (BuiltInSection.INTERACTION_HISTORY, "User: hello"),
+        ]
+    )
+    built = builder.build()
+    tampered = "X" + built[1:]
+    logger = Mock()
+
+    ors._split_divergence_warned.discard("test/model")
+    try:
+        for _ in range(2):
+            result = _split_prompt_for_caching(
+                builder,
+                tampered,
+                ttl=None,
+                min_prefix_chars=_MIN_CACHE_PREFIX_CHARS,
+                logger=logger,
+                model_name="test/model",
+            )
+            assert result is None
+    finally:
+        ors._split_divergence_warned.discard("test/model")
+
+    assert logger.warning.call_count == 1
+    assert "diverged" in logger.warning.call_args.args[0]
