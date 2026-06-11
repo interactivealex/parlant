@@ -31,6 +31,17 @@ def escape_json_string(s: str) -> str:
     return json.dumps(s)[1:-1]
 
 
+def guideline_gist(condition: str, action: Optional[str], max_words: int = 12) -> str:
+    # The guidelines echo in generator output schemas is pure chain-of-thought:
+    # nothing parses it, and every word is paid for in output tokens on every
+    # message generation. A few-word gist keeps the attention anchor; the full
+    # text already sits in the prompt's guidelines section. Agent-intention
+    # guidelines can have an empty condition — the action is the gist then.
+    words = (condition or action or "").split()
+    gist = " ".join(words[:max_words])
+    return f"{gist}…" if len(words) > max_words else gist
+
+
 def internal_representation(g: Guideline) -> GuidelineInternalRepresentation:
     action, condition = g.content.action, g.content.condition
     description = g.content.description

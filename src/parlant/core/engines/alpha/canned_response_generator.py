@@ -38,6 +38,7 @@ from parlant.core.customers import Customer
 from parlant.core.engines.alpha.guideline_matching.generic.common import (
     GuidelineInternalRepresentation,
     internal_representation,
+    guideline_gist,
 )
 from parlant.core.engines.alpha.hooks import EngineHooks
 from parlant.core.engines.alpha.engine_context import EngineContext
@@ -106,7 +107,7 @@ def _format_guideline(condition: str, action: str) -> str:
 
 class CannedResponseDraftSchema(DefaultBaseModel):
     last_message_of_user: Optional[str]
-    guidelines: list[str]
+    guidelines: Optional[list[str]] = None
     insights: Optional[list[str]] = None
     response_preamble_that_was_already_sent: Optional[str] = None
     response_body: Optional[str] = None
@@ -1462,7 +1463,7 @@ If told so by a guideline or some other contextual condition, send the first mes
 If you decide not to emit a message, output the following:
 {{
     "last_message_of_user": "<user's last message>",
-    "guidelines": [<list of strings- a re-statement of all guidelines>],
+    "guidelines": [<list of strings- a FEW-WORD gist of each applicable guideline's condition. Do NOT restate guidelines in full; the full text is already above and restating it wastes time>],
     "insights": [<list of strings- up to 3 original insights>],
     "response_preamble_that_was_already_sent": null,
     "response_body": null
@@ -1682,7 +1683,7 @@ Produce a valid JSON object according to the following spec. Use the values prov
             internal_rep = internal_representation(g.guideline)
             if internal_rep.action and not g.guideline.criticality == Criticality.LOW:
                 guidelines_list_items.append(
-                    f'"{_format_guideline(internal_rep.condition, internal_rep.action)}"'
+                    f'"{guideline_gist(internal_rep.condition, internal_rep.action)}"'
                 )
         guidelines_list_text = ", ".join(guidelines_list_items)
 
@@ -2798,8 +2799,8 @@ def shot_canned_canned_response_id(number: int) -> str:
 draft_generation_example_1_expected = CannedResponseDraftSchema(
     last_message_of_user="Hi, I'd like an onion cheeseburger please.",
     guidelines=[
-        "When the user chooses and orders a burger, then provide it",
-        "When the user chooses specific ingredients on the burger, only provide those ingredients if we have them fresh in stock; otherwise, reject the order",
+        "the user chooses and orders a burger",
+        "the user chooses specific ingredients on the burger",
     ],
     insights=[
         "As appears in the tool results, all of our cheese has expired and is currently out of stock",
@@ -2818,7 +2819,7 @@ draft_generation_example_1_shot = CannedResponseGeneratorDraftShot(
 
 draft_generation_example_2_expected = CannedResponseDraftSchema(
     last_message_of_user="Hi there, can I get something to drink? What do you have on tap?",
-    guidelines=["When the user asks for a drink, check the menu and offer what's on it"],
+    guidelines=["the user asks for a drink"],
     insights=[
         "According to contextual information about the user, this is their first time here",
         "There's no menu information in my context",

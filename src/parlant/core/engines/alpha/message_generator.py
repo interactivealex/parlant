@@ -27,6 +27,7 @@ from parlant.core.context_variables import ContextVariable, ContextVariableValue
 from parlant.core.customers import Customer
 from parlant.core.engines.alpha.guideline_matching.generic.common import (
     GuidelineInternalRepresentation,
+    guideline_gist,
     internal_representation,
 )
 from parlant.core.engines.alpha.engine_context import EngineContext
@@ -389,7 +390,7 @@ If you decide not to emit a message, output the following:
 {{
     "last_message_of_customer": None,
     "produced_reply": false,
-    "guidelines": [<list of strings- a re-statement of all guidelines>],
+    "guidelines": [<list of strings- a FEW-WORD gist of each applicable guideline's condition. Do NOT restate guidelines in full; the full text is already above and restating it wastes time>],
     "context_evaluation": None,
     "insights": [<list of strings- up to 3 original insights>],
     "produced_reply_rationale": "<a few words to justify why a reply was NOT produced here>",
@@ -638,7 +639,10 @@ Produce a valid JSON object in the following format: ###
             ),
             "",
         )
-        guidelines_list_text = ", ".join([f'"{g.guideline}"' for g in guidelines])
+        guidelines_list_text = ", ".join(
+            f'"{guideline_gist(rep.condition, rep.action)}"'
+            for rep in (guideline_representations[g.guideline.id] for g in guidelines)
+        )
         guidelines_output_format = "\n".join(
             [
                 f"""
@@ -786,9 +790,7 @@ Produce a valid JSON object in the following format: ###
 example_1_expected = MessageSchema(
     last_message_of_customer="Hi, I'd like to know the schedule for the next trains to Boston, please.",
     produced_reply=True,
-    guidelines=[
-        "When the customer asks for train schedules, provide them accurately and concisely."
-    ],
+    guidelines=["the customer asks for train schedules"],
     context_evaluation=ContextEvaluation(
         most_recent_customer_inquiries_or_needs="Knowing the schedule for the next trains to Boston",
         parts_of_the_context_i_have_here_if_any_with_specific_information_on_how_to_address_these_needs="The interaction history contains a tool call with the train schedule for Boston",
@@ -903,9 +905,9 @@ example_1_shot = MessageGeneratorShot(
 example_2_expected = MessageSchema(
     last_message_of_customer="Alright, can I get the American burger with cheese?",
     guidelines=[
-        "When the customer chooses and orders a burger, then provide it",
-        "When the customer chooses specific ingredients on the burger, only provide those ingredients if we have them fresh in stock; otherwise, reject the order",
-        "Agent intention guideline: When processing a new order, confirm the order details and price with the customer",
+        "the customer chooses and orders a burger",
+        "the customer chooses specific ingredients on the burger",
+        "processing a new order",
     ],
     context_evaluation=ContextEvaluation(
         most_recent_customer_inquiries_or_needs="The customer ordered an American burger with cheese",
@@ -984,7 +986,7 @@ example_2_shot = MessageGeneratorShot(
 
 example_3_expected = MessageSchema(
     last_message_of_customer="Hi there, can I get something to drink? What do you have on tap?",
-    guidelines=["When the customer asks for a drink, check the menu and offer what's on it"],
+    guidelines=["the customer asks for a drink"],
     context_evaluation=ContextEvaluation(
         most_recent_customer_inquiries_or_needs="Knowing what drinks we have on tap",
         parts_of_the_context_i_have_here_if_any_with_specific_information_on_how_to_address_these_needs="None",
@@ -1122,7 +1124,7 @@ example_5_expected = MessageSchema(
         "How much money do I have in my account, and how do you know it? Is there some service you use to check "
         "my balance? Can I access it too?"
     ),
-    guidelines=["When you need the balance of a customer, then use the 'check_balance' tool."],
+    guidelines=["you need the balance of a customer"],
     context_evaluation=ContextEvaluation(
         most_recent_customer_inquiries_or_needs="Know how much money they have in their account; Knowing how and what I use to know how much money they have",
         parts_of_the_context_i_have_here_if_any_with_specific_information_on_how_to_address_these_needs="I know how much money they have based on a tool call's result",
