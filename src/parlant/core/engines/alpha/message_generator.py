@@ -671,7 +671,19 @@ Produce a valid JSON object in the following format: ###
             <Additional entries for all insights>
 """
 
-        return f"""
+        # Same imperative as the canned-response draft spec: without it the
+        # model intermittently ignores the pre-filled gists and restates every
+        # guideline in full, paying for it in output tokens on every turn.
+        gist_note = (
+            '\nThe "guidelines" value below is pre-filled with a few-word gist of each'
+            " applicable guideline. Output it EXACTLY as shown - do NOT expand the gists"
+            " or restate any guideline in full. The full text already appears above;"
+            " restating it wastes time.\n"
+            if guidelines
+            else ""
+        )
+
+        return f"""{gist_note}
 ```json
 {{
     "last_message_of_customer": "{last_customer_message}",

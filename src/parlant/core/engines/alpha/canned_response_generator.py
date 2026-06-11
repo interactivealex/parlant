@@ -1687,7 +1687,20 @@ Produce a valid JSON object according to the following spec. Use the values prov
                 )
         guidelines_list_text = ", ".join(guidelines_list_items)
 
-        return f"""
+        # The pre-filled gists alone don't stop the model from restating: live
+        # outputs were bimodal (gist-sized vs full multi-kB restatements of the
+        # same guidelines) until the spec carried this explicit imperative,
+        # mirroring the initial-message template's instruction.
+        gist_note = (
+            '\nThe "guidelines" value below is pre-filled with a few-word gist of each'
+            " applicable guideline. Output it EXACTLY as shown - do NOT expand the gists"
+            " or restate any guideline in full. The full text already appears above;"
+            " restating it wastes time.\n"
+            if guidelines_list_items
+            else ""
+        )
+
+        return f"""{gist_note}
 {{
     "last_message_of_user": "{last_user_message}",
     "guidelines": [{guidelines_list_text}],
