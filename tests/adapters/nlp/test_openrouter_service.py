@@ -1712,3 +1712,169 @@ def test_that_prompt_cache_divergence_warns_exactly_once_per_model() -> None:
 
     assert logger.warning.call_count == 1
     assert "diverged" in logger.warning.call_args.args[0]
+
+
+# --- History-breakpoint test helpers ------------------------------------------
+
+
+def _adapted_event(source: str, message: str) -> str:
+    """An event string in the shape PromptBuilder.adapt_event produces."""
+    return json.dumps(
+        {"event_kind": "message", "event_source": source, "data": {"message": message}}
+    )
+
+
+def _make_history_prompt_builder(
+    events: list[str],
+    *,
+    middle: Sequence[tuple[str | BuiltInSection, str]] = (
+        (BuiltInSection.CONTEXT_VARIABLES, "Known user info: plan=gold"),
+        ("task-instructions", "Use the canned responses below."),
+    ),
+) -> PromptBuilder:
+    """A builder shaped like the real history-bearing prompt families:
+    stable prefix, session-stable middle, event-list history, volatile tail."""
+    builder = PromptBuilder()
+    builder.add_section("instructions", _LARGE_STATIC_PREFIX)
+    builder.add_section(BuiltInSection.AGENT_IDENTITY, "Agent: Bob")
+    for name, text in middle:
+        builder.add_section(name, text)
+    builder.add_section(
+        BuiltInSection.INTERACTION_HISTORY,
+        PromptBuilder._INTERACTION_BODY,
+        props={"interaction_events": events},
+    )
+    builder.add_section(BuiltInSection.GUIDELINES, "Guideline: be brief.")
+    builder.add_section("output-format", "Respond with JSON.")
+    return builder
+
+
+def _split_blocks(builder: PromptBuilder, *, ttl: str | None = None) -> list[dict[str, Any]]:
+    built = builder.build()
+    blocks = _split_prompt_for_caching(
+        builder, built, ttl=ttl, min_prefix_chars=_MIN_CACHE_PREFIX_CHARS
+    )
+    assert blocks is not None
+    assert "".join(block["text"] for block in blocks) == built
+    return blocks
+
+
+def test_that_history_breakpoint_is_placed_at_the_last_event_boundary() -> None:
+    """A history-bearing prompt gets a second breakpoint after the last event.
+    The session-stable middle is inside the cached region; the list's closing
+    bracket and every volatile tail section are outside it."""
+    events = [_adapted_event("user", f"message {i} with l'accent é") for i in range(4)]
+    blocks = _split_blocks(_make_history_prompt_builder(events))
+
+    breakpoints = [i for i, block in enumerate(blocks) if "cache_control" in block]
+    assert len(breakpoints) == 2
+    assert breakpoints[0] == 0
+
+    assert blocks[breakpoints[1]]["text"].endswith(repr(events[-1]))
+    cached = "".join(block["text"] for block in blocks[: breakpoints[1] + 1])
+    tail = "".join(block["text"] for block in blocks[breakpoints[1] + 1 :])
+    assert "plan=gold" in cached
+    assert tail.startswith("]")
+    assert "Guideline: be brief." in tail
+
+
+def test_that_history_breakpoint_boundary_survives_appended_events() -> None:
+    """Cross-turn cache-hit mechanics: the provider resolves a breakpoint by
+    walking back over content-block boundaries looking for a cached prefix.
+    Turn N's cached prefix (everything up to its history breakpoint) must
+    therefore reappear in turn N+1's request as the cumulative content at some
+    block boundary, within the provider's ~20-block lookback."""
+    events = [_adapted_event("user", f"message {i}") for i in range(6)]
+
+    turn_n = _split_blocks(_make_history_prompt_builder(events[:4]))
+    turn_n1 = _split_blocks(_make_history_prompt_builder(events))
+
+    bp2_n = max(i for i, block in enumerate(turn_n) if "cache_control" in block)
+    cached_prefix_n = "".join(block["text"] for block in turn_n[: bp2_n + 1])
+
+    boundaries_n1 = [
+        "".join(block["text"] for block in turn_n1[: i + 1]) for i in range(len(turn_n1))
+    ]
+    assert cached_prefix_n in boundaries_n1
+
+    bp2_n1 = max(i for i, block in enumerate(turn_n1) if "cache_control" in block)
+    assert bp2_n1 - boundaries_n1.index(cached_prefix_n) <= 20
+
+
+def test_that_a_volatile_section_before_history_degrades_to_a_prefix_only_breakpoint() -> None:
+    """A per-turn section (e.g. GLOSSARY) between the stable prefix and the
+    history would re-render every turn and poison every cached byte after it,
+    so the split keeps only the prefix breakpoint."""
+    events = [_adapted_event("user", "hello")]
+    builder = _make_history_prompt_builder(
+        events, middle=[(BuiltInSection.GLOSSARY, "term: AHT means handle time")]
+    )
+    blocks = _split_blocks(builder)
+
+    assert sum(1 for block in blocks if "cache_control" in block) == 1
+    assert len(blocks) == 2
+
+
+def test_that_empty_history_degrades_to_a_prefix_only_breakpoint() -> None:
+    """First turn: the history section is the no-events template with no
+    interaction_events prop, so there is nothing append-only to cache."""
+    builder = PromptBuilder()
+    builder.add_section("instructions", _LARGE_STATIC_PREFIX)
+    builder.add_section(BuiltInSection.INTERACTION_HISTORY, PromptBuilder._EMPTY_HISTORY)
+    builder.add_section("output-format", "Respond with JSON.")
+    blocks = _split_blocks(builder)
+
+    assert sum(1 for block in blocks if "cache_control" in block) == 1
+
+
+def test_that_old_events_coalesce_keeping_the_last_window_as_individual_blocks() -> None:
+    """Block count must stay bounded on long conversations: only the trailing
+    window of events gets individual blocks (those are the boundaries the next
+    turns' lookback needs); older events merge into the first history block."""
+    from parlant.adapters.nlp.openrouter_service import _HISTORY_EVENT_BLOCK_WINDOW
+
+    events = [_adapted_event("user", f"message {i}") for i in range(20)]
+    blocks = _split_blocks(_make_history_prompt_builder(events))
+
+    # prefix + coalesced base + window of individual events + tail
+    assert len(blocks) == 1 + 1 + _HISTORY_EVENT_BLOCK_WINDOW + 1
+    individual = blocks[2 : 2 + _HISTORY_EVENT_BLOCK_WINDOW]
+    assert [block["text"] for block in individual] == [
+        ", " + repr(event) for event in events[20 - _HISTORY_EVENT_BLOCK_WINDOW :]
+    ]
+
+
+def test_that_ttl_is_forwarded_to_both_breakpoints() -> None:
+    events = [_adapted_event("user", "hello")]
+    blocks = _split_blocks(_make_history_prompt_builder(events), ttl="1h")
+
+    controls = [block["cache_control"] for block in blocks if "cache_control" in block]
+    assert controls == [{"type": "ephemeral", "ttl": "1h"}] * 2
+
+
+async def test_that_history_breakpoint_reaches_the_request_content_blocks(
+    container: Container,
+) -> None:
+    """Wire-level: the multi-block split passes through _create_completion
+    verbatim — two cache_control markers, blocks concatenating to build()."""
+    events = [_adapted_event("user", f"message {i}") for i in range(3)]
+    builder = _make_history_prompt_builder(events)
+    built = builder.build()
+    mock_response = _make_chat_response(
+        '{"test_field": "ok"}',
+        CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_PROMPT_CACHE": "true"}, clear=False),
+        _openrouter_generator(container, create_side_effect=[mock_response]) as (
+            generator,
+            mock_client,
+        ),
+    ):
+        await generator.do_generate(builder)
+
+    content = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert sum(1 for block in content if "cache_control" in block) == 2
+    assert "".join(block["text"] for block in content) == built

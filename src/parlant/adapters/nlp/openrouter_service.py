@@ -41,6 +41,7 @@ from parlant.adapters.nlp.common import normalize_json_output, record_llm_metric
 from parlant.core.engines.alpha.prompt_builder import (
     BuiltInSection,
     PromptBuilder,
+    PromptSection,
     render_section,
 )
 from parlant.core.loggers import Logger
@@ -153,7 +154,10 @@ _MIN_CACHE_PREFIX_CHARS = 4096
 # once, not per generation. The two INFO sets give a positive deployment signal
 # that the split fired and that the provider actually reported cache hits.
 _split_divergence_warned: set[str] = set()
-_cache_split_logged: set[str] = set()
+# Keyed by (model, breakpoint count) so the history breakpoint's first activation
+# is visible even when the model's first-ever split was a single-breakpoint one
+# (first turns have no history to cache).
+_cache_split_logged: set[tuple[str, int]] = set()
 _cache_hit_logged: set[str] = set()
 
 # PromptBuilder sections whose rendered content can change from one turn to the
@@ -198,6 +202,112 @@ assert not (_DYNAMIC_SECTIONS & _STABLE_BUILTIN_SECTIONS), (
     f"{_DYNAMIC_SECTIONS & _STABLE_BUILTIN_SECTIONS}"
 )
 
+# Sections allowed to sit between the stable prefix and INTERACTION_HISTORY without
+# blocking the history breakpoint. The region up to that breakpoint is only ever a
+# cache hit when its bytes repeat across turns, so the allowlist admits sections
+# that change rarely within a session: the identity sections, CONTEXT_VARIABLES
+# (refreshes are infrequent; a refresh costs one cache rewrite and self-heals on
+# the next turn), and custom string-keyed instruction sections (static templates).
+# Relevance-retrieved sections (GLOSSARY, CAPABILITIES) and per-turn matching
+# output (GUIDELINES etc.) re-render differently every turn — any of them before
+# the history would make the breakpoint a guaranteed every-turn cache write, so
+# they disqualify the split and the prompt degrades to the prefix breakpoint only.
+_SESSION_STABLE_SECTIONS: frozenset[BuiltInSection] = _STABLE_BUILTIN_SECTIONS | {
+    BuiltInSection.CONTEXT_VARIABLES
+}
+
+# How many trailing history events are emitted as individual content blocks.
+# Anthropic resolves a cache breakpoint by walking back up to ~20 content-block
+# boundaries looking for a cached prefix, so last turn's breakpoint is only
+# rediscovered if the events appended since then sit in their own blocks. A turn
+# typically appends 1-6 events (customer message, tool events, agent reply);
+# 12 leaves slack for multi-iteration turns while keeping the block count small.
+# Older events are coalesced into the first history block.
+_HISTORY_EVENT_BLOCK_WINDOW = 12
+
+
+def _split_history_for_caching(
+    items: list[tuple[str | BuiltInSection, PromptSection]],
+    first_dynamic: int,
+    remainder: str,
+) -> tuple[list[str], str] | None:
+    """Split *remainder* (the built prompt after the stable prefix) into
+    cacheable history block texts and an uncached tail, or return None when the
+    prompt shape does not support a history breakpoint.
+
+    The conversation history is the largest and fastest-growing part of the
+    prompt, and it is append-only: this turn's event list extends last turn's.
+    Anthropic resolves a cache breakpoint by walking back over content-block
+    boundaries looking for an exactly-matching cached prefix, so the events are
+    emitted as individual blocks — the boundary last turn's breakpoint sat on
+    still exists, byte-identical, in this turn's request, and the lookup hits
+    there. A single monolithic history block would never hit: its bytes change
+    every turn, and partial-block matches don't exist.
+
+    The split is refused (returning None, degrading to the prefix-only
+    breakpoint) when:
+    - any section between the stable prefix and INTERACTION_HISTORY re-renders
+      per turn (see _SESSION_STABLE_SECTIONS) — it would poison every cached
+      byte after it;
+    - the history is empty/passive (first turn) or its rendered form cannot be
+      reconciled byte-for-byte with *remainder* (same degrade-don't-corrupt
+      rule as the prefix split).
+
+    The breakpoint lands after the *last event*, not at the section end: the
+    list's closing bracket and the section footer (and the per-turn
+    last-agent-message note) belong to the uncached tail, otherwise the final
+    bytes would differ between turn N and turn N+1 and the boundary would
+    never repeat.
+    """
+    history_idx = next(
+        (i for i, (name, _) in enumerate(items) if name == BuiltInSection.INTERACTION_HISTORY),
+        None,
+    )
+    if history_idx is None:
+        return None
+
+    for name, _ in items[first_dynamic:history_idx]:
+        if isinstance(name, BuiltInSection) and name not in _SESSION_STABLE_SECTIONS:
+            return None
+
+    history_section = items[history_idx][1]
+    events = history_section.props.get("interaction_events")
+    if not isinstance(events, list) or not events:
+        return None
+
+    middle_text = "".join(
+        render_section(section.template, section.props) + "\n\n"
+        for _, section in items[first_dynamic:history_idx]
+    )
+    history_text = render_section(history_section.template, history_section.props)
+
+    # The template interpolates the events list via str.format, which renders
+    # str(list) — "[" + ", ".join(repr(event)) + "]". Reconstructing that exact
+    # string from the same parts yields the byte offset of every event boundary
+    # within the rendered section; the equality check guards against the
+    # rendering form ever drifting from this construction.
+    events_text = str(events)
+    events_at = history_text.find(events_text)
+    if events_at < 0:
+        return None
+    event_parts = ["[" + repr(events[0])] + [", " + repr(event) for event in events[1:]]
+    if "".join(event_parts) + "]" != events_text:
+        return None
+
+    cacheable = middle_text + history_text[:events_at] + "".join(event_parts)
+    if not remainder.startswith(cacheable):
+        return None
+
+    tail = remainder[len(cacheable) :]
+    window = event_parts[-_HISTORY_EVENT_BLOCK_WINDOW:]
+    base = (
+        middle_text
+        + history_text[:events_at]
+        + "".join(event_parts[: len(event_parts) - len(window)])
+    )
+    blocks = [base, *window] if base else list(window)
+    return blocks, tail
+
 
 def _split_prompt_for_caching(
     prompt: PromptBuilder,
@@ -208,18 +318,24 @@ def _split_prompt_for_caching(
     logger: Logger | None = None,
     model_name: str | None = None,
 ) -> list[_ContentBlock] | None:
-    """Split an already-built prompt into a cached stable-prefix block and an
-    uncached variable-tail block, or return None when no worthwhile (or safe) split
-    exists.
+    """Split an already-built prompt into cache-controlled blocks and an uncached
+    variable-tail block, or return None when no worthwhile (or safe) split exists.
 
     *built* is ``prompt.build()``'s output, passed in so the full prompt is
-    rendered only once. The breakpoint is placed before the first per-turn
-    (dynamic) section; only the leading prefix sections are re-rendered, to locate
-    the cut point. The returned block texts concatenate to exactly *built*, so the
-    prompt the model receives is byte-for-byte unchanged. When the dynamic tail is
-    empty this turn the whole prompt is returned as a single cached block; when the
-    re-rendered prefix cannot be reconciled with *built*, None is returned so the
-    caller falls back to a flat prompt rather than risk corrupting it.
+    rendered only once. Up to two cache breakpoints are placed:
+
+    1. at the end of the leading run of stable sections (before the first
+       per-turn section), and
+    2. when the prompt shape allows it (see _split_history_for_caching), after
+       the last event of INTERACTION_HISTORY — caching the conversation body,
+       the largest and append-only token mass.
+
+    Only the relevant sections are re-rendered, to locate the cut points. The
+    returned block texts concatenate to exactly *built*, so the prompt the model
+    receives is byte-for-byte unchanged. When the dynamic tail is empty this turn
+    the whole prompt is returned as a single cached block; when the re-rendered
+    prefix cannot be reconciled with *built*, None is returned so the caller
+    falls back to a flat prompt rather than risk corrupting it.
     """
     items = list(prompt.sections.items())
 
@@ -284,11 +400,16 @@ def _split_prompt_for_caching(
     if ttl:
         cache_control["ttl"] = ttl
 
-    # The prefix carries the cache breakpoint; the variable tail, when present, is a
-    # second uncached block. The block texts concatenate to exactly `built`.
     blocks: list[_ContentBlock] = [
-        {"type": "text", "text": prefix_text, "cache_control": cache_control},
+        {"type": "text", "text": prefix_text, "cache_control": dict(cache_control)},
     ]
+
+    history_split = _split_history_for_caching(items, first_dynamic, suffix_text)
+    if history_split is not None:
+        history_blocks, suffix_text = history_split
+        blocks.extend({"type": "text", "text": text} for text in history_blocks)
+        blocks[-1]["cache_control"] = dict(cache_control)
+
     if suffix_text:
         blocks.append({"type": "text", "text": suffix_text})
     return blocks
@@ -621,12 +742,16 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
                     logger=self.logger,
                     model_name=self.model_name,
                 )
-                if message_content is not None and self.model_name not in _cache_split_logged:
-                    _cache_split_logged.add(self.model_name)
-                    self.logger.info(
-                        f"Prompt cache: first cache split produced for model"
-                        f" '{self.model_name}' ({len(message_content[0]['text'])} prefix chars)."
-                    )
+                if message_content is not None:
+                    breakpoints = sum(1 for block in message_content if "cache_control" in block)
+                    if (self.model_name, breakpoints) not in _cache_split_logged:
+                        _cache_split_logged.add((self.model_name, breakpoints))
+                        self.logger.info(
+                            f"Prompt cache: first cache split produced for model"
+                            f" '{self.model_name}' ({len(message_content[0]['text'])} prefix"
+                            f" chars, {breakpoints} breakpoint(s),"
+                            f" {len(message_content)} blocks)."
+                        )
 
         openrouter_api_arguments = {
             k: v for k, v in hints.items() if k in self.supported_openrouter_params

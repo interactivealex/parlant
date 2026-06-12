@@ -27,7 +27,7 @@ generator.
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 from pytest import fixture, mark, raises
@@ -88,7 +88,7 @@ class _NullHistogram:
 @fixture(autouse=True)
 def _null_batch_histogram() -> Any:
     prior = gm_common._MATCHING_BATCH_DURATION_HISTOGRAM
-    gm_common._MATCHING_BATCH_DURATION_HISTOGRAM = _NullHistogram()
+    gm_common._MATCHING_BATCH_DURATION_HISTOGRAM = cast(Any, _NullHistogram())
     yield
     gm_common._MATCHING_BATCH_DURATION_HISTOGRAM = prior
 
@@ -113,7 +113,7 @@ class _FlakyGenerator:
 
 
 def _make_batch(batch_class: type, generator: _FlakyGenerator) -> Any:
-    batch = object.__new__(batch_class)
+    batch: Any = object.__new__(batch_class)
     batch._logger = MagicMock()
     batch._meter = MagicMock()
     batch._optimization_policy = MagicMock(

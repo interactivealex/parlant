@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from croniter import croniter
 from lagom import Container
 from pytest import mark
@@ -234,7 +235,7 @@ async def test_that_parallel_variable_loading_preserves_variable_order_and_key_p
 
     from parlant.core.engines.alpha.engine import AlphaEngine
 
-    engine = object.__new__(AlphaEngine)
+    engine: Any = object.__new__(AlphaEngine)
 
     variables = [Mock(id=f"var-{i}", name=f"v{i}") for i in range(5)]
     engine._entity_queries = Mock(
@@ -242,7 +243,7 @@ async def test_that_parallel_variable_loading_preserves_variable_order_and_key_p
     )
 
     # var-0 resolves on the customer key, var-2 on the global key, others never.
-    async def load_value(context, variable, key):
+    async def load_value(context: Any, variable: Any, key: str) -> str | None:
         if variable.id == "var-0" and key == "customer-1":
             return "customer-value"
         if variable.id == "var-2":
@@ -258,7 +259,7 @@ async def test_that_parallel_variable_loading_preserves_variable_order_and_key_p
 
     result = await AlphaEngine._load_context_variables(engine, context)
 
-    assert [(v.id, value) for v, value in result] == [
+    assert [(str(v.id), str(value)) for v, value in result] == [
         ("var-0", "customer-value"),
         ("var-2", "global-value"),
     ]
