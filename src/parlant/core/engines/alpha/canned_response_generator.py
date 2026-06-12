@@ -580,6 +580,10 @@ class CannedResponseGenerator(MessageEventComposer):
             name="preamble.render",
             description="Duration of canned response rendering in milliseconds",
         )
+        self._hist_tool_announcement_duration = _create_histogram(
+            name="tool_announcement",
+            description="Duration of tool call announcement generation in milliseconds",
+        )
         self._hist_render_duration = _create_histogram(
             name="render",
             description="Duration of canned response rendering in milliseconds",
@@ -921,6 +925,130 @@ You will now be given the current state of the interaction to which you must gen
             ]
 
         return []
+
+    @override
+    async def generate_tool_call_announcement(
+        self,
+        context: EngineContext,
+        tool_events: Sequence[EmittedEvent],
+    ) -> Sequence[MessageEventComposition]:
+        with self._logger.scope("MessageEventComposer"):
+            with self._logger.scope("CannedResponseGenerator"):
+                async with self._hist_tool_announcement_duration.measure():
+                    return await self._do_generate_tool_call_announcement(context, tool_events)
+
+    async def _do_generate_tool_call_announcement(
+        self,
+        context: EngineContext,
+        tool_events: Sequence[EmittedEvent],
+    ) -> Sequence[MessageEventComposition]:
+        agent = context.agent
+
+        # This coroutine runs inside an asyncio task, concurrently with later
+        # preparation iterations that mutate these collections. Snapshot them
+        # in the synchronous prefix — before the first await — so the prompt
+        # is built from the state of the iteration whose tools we announce.
+        guideline_matches = (
+            *context.state.ordinary_guideline_matches,
+            *context.state.tool_enabled_guideline_matches.keys(),
+        )
+        staged_message_events = list(context.state.message_events)
+
+        composition_mode = await self._resolve_composition_mode(context)
+
+        if composition_mode == CompositionMode.CANNED_STRICT:
+            # Strict agents may only speak in pre-approved canned responses,
+            # which the announcement generator does not select from.
+            return []
+
+        prompt_builder = PromptBuilder(
+            on_build=lambda prompt: self._logger.trace(f"Tool call announcement Prompt:\n{prompt}")
+        )
+
+        prompt_builder.add_agent_identity(agent)
+
+        guidelines_text = "\n".join(
+            f"- When {m.guideline.content.condition}, then: {m.guideline.content.action}"
+            for m in guideline_matches
+            if m.guideline.content.action
+        )
+
+        announcement_choices_text = "".join(
+            f"\n- {choice}" for choice in default_tool_call_announcement_examples
+        )
+
+        prompt_builder.add_section(
+            name="tool-call-announcement-instructions",
+            template="""\
+You are an AI agent that just finished running one or more background operations
+(tools) while preparing a full response for the customer. The full response will
+be sent shortly by a smarter agent. Your only job is to generate a very short,
+natural status message telling the customer what you just did, so they know
+things are progressing.
+
+The operations that just ran, including their results, are listed below under
+STAGED EVENTS.
+
+Behavioral guidelines currently active for this conversation (for tone and
+context only — do not act on them): ###
+{guidelines_text}
+###
+
+The announcement must:
+- Be a single, short sentence (aim for under 12 words)
+- Describe what was just done in plain, customer-friendly terms (e.g. "I've checked your account")
+- NEVER mention internal tool names, ids, systems, or technical details
+- NOT state the actual answer, results, figures, or conclusions — the full response comes next
+- NOT ask questions, make commitments, or indicate next steps
+- NOT repeat or paraphrase previous messages, preambles, or announcements — it must add something new
+
+Here are some GOOD EXAMPLES of announcement messages: ###
+{announcement_choices_text}
+###
+
+You must produce a JSON object with a single key, "preamble", holding the announcement message as a string.
+""",
+            props={
+                "guidelines_text": guidelines_text or "- (none)",
+                "announcement_choices_text": announcement_choices_text,
+            },
+        )
+
+        prompt_builder.add_interaction_history_for_message_generation(
+            context.interaction.events,
+            staged_message_events,
+        )
+
+        prompt_builder.add_staged_tool_events(tool_events)
+
+        generation = await self._canrep_preamble_generator.generate(
+            prompt=prompt_builder, hints={"temperature": 0.1}
+        )
+
+        self._logger.trace(
+            f"Tool call announcement Completion:\n{generation.content.model_dump_json(indent=2)}"
+        )
+
+        if not generation.content.preamble:
+            return []
+
+        handle = await context.session_event_emitter.emit_message_event(
+            trace_id=self._tracer.trace_id,
+            data=MessageEventData(
+                message=generation.content.preamble,
+                participant=Participant(id=agent.id, display_name=agent.name),
+                tags=[Tag.preamble().id],
+            ),
+        )
+
+        self._tracer.add_event("canrep.tool_call_announcement_generated")
+
+        return [
+            MessageEventComposition(
+                generation_info={"tool_call_announcement": generation.info},
+                events=[handle.event],
+            )
+        ]
 
     @override
     async def generate_response(
@@ -2991,4 +3119,12 @@ default_fluid_preamble_greeting_responses: list[str] = [
     "Hello",
     "Hi",
     "Hey",
+]
+
+default_tool_call_announcement_examples: list[str] = [
+    "I've pulled up your account details",
+    "Just checked that in our system",
+    "I've looked into that for you",
+    "Got the latest information on that",
+    "Alright, I've run a quick check on that",
 ]

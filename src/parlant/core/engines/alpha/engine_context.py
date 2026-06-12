@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from __future__ import annotations
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional, Sequence, cast
@@ -159,6 +160,8 @@ class ResponseState:
     message_events: list[EmittedEvent]
     usable_guidelines: list[Guideline] = field(default_factory=list)
     additional_canned_response_fields: dict[str, Any] = field(default_factory=dict)
+    # Typed loosely (Any) to avoid a circular import with message_event_composer.
+    tool_announcement_tasks: list[asyncio.Task[Any]] = field(default_factory=list)
 
     @property
     def ordinary_guidelines(self) -> list[Guideline]:

@@ -41,6 +41,13 @@ class MessageEventComposer:
     ) -> Sequence[MessageEventComposition]: ...
 
     @abstractmethod
+    async def generate_tool_call_announcement(
+        self,
+        context: EngineContext,
+        tool_events: Sequence[EmittedEvent],
+    ) -> Sequence[MessageEventComposition]: ...
+
+    @abstractmethod
     async def generate_response(
         self,
         context: EngineContext,

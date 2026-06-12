@@ -14,10 +14,11 @@
 
 from abc import ABC, abstractmethod
 import random
-from typing import cast
+from typing import Sequence, cast
 from typing_extensions import override
 
 from parlant.core.agents import AgentId
+from parlant.core.emissions import EmittedEvent
 from parlant.core.engines.alpha.engine_context import EngineContext
 from parlant.core.sessions import EventKind, EventSource, MessageEventData
 from parlant.core.tags import Tag
@@ -88,6 +89,21 @@ class PerceivedPerformancePolicy(ABC):
 
         :param context: The loaded context containing session and interaction details.
         :return: True if a preamble is required, False otherwise.
+        """
+        ...
+
+    @abstractmethod
+    async def is_tool_call_announcement_required(
+        self,
+        context: EngineContext | None = None,
+        tool_events: Sequence[EmittedEvent] | None = None,
+    ) -> bool:
+        """
+        Determines if a status message should be generated after tool calls complete.
+
+        :param context: The loaded context containing session and interaction details.
+        :param tool_events: The tool events produced by the just-executed tool calls.
+        :return: True if an announcement should be generated, False otherwise.
         """
         ...
 
@@ -163,6 +179,14 @@ class BasicPerceivedPerformancePolicy(PerceivedPerformancePolicy):
             # we need the preamble to keep the customer engaged.
             return True
 
+        return False
+
+    @override
+    async def is_tool_call_announcement_required(
+        self,
+        context: EngineContext | None = None,
+        tool_events: Sequence[EmittedEvent] | None = None,
+    ) -> bool:
         return False
 
     @override
@@ -251,6 +275,14 @@ class NullPerceivedPerformancePolicy(PerceivedPerformancePolicy):
         return False
 
     @override
+    async def is_tool_call_announcement_required(
+        self,
+        context: EngineContext | None = None,
+        tool_events: Sequence[EmittedEvent] | None = None,
+    ) -> bool:
+        return False
+
+    @override
     async def is_message_splitting_required(
         self,
         context: EngineContext,
@@ -266,6 +298,25 @@ class VoiceOptimizedPerceivedPerformancePolicy(NullPerceivedPerformancePolicy):
         context: EngineContext | None = None,
     ) -> bool:
         return True
+
+
+class AnnouncingPerceivedPerformancePolicy(BasicPerceivedPerformancePolicy):
+    """Extends the basic policy with post-tool-call status announcements.
+
+    On top of the preamble behavior, after each batch of tool calls completes,
+    the engine emits a short customer-visible message describing what was just
+    done, so the customer perceives progress while the full response is still
+    being composed.
+    """
+
+    @override
+    async def is_tool_call_announcement_required(
+        self,
+        context: EngineContext | None = None,
+        tool_events: Sequence[EmittedEvent] | None = None,
+    ) -> bool:
+        # None and [] both map to False — announce only when tools actually ran.
+        return bool(tool_events)
 
 
 class PerceivedPerformancePolicyProvider:

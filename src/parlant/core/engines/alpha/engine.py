@@ -337,6 +337,11 @@ class AlphaEngine(Engine):
                 # Update session labels from matched entities
                 await self._update_session_labels(context)
 
+                # Make sure every pending tool-call announcement has been
+                # emitted (and is visible to the response prompt as a staged
+                # message) before the final response is composed.
+                await self._collect_tool_announcements(context)
+
                 # Money time: communicate with the customer given
                 # all of the information we have prepared.
                 with self._tracer.span(_MESSAGE_GENERATION_SPAN_NAME):
@@ -381,6 +386,10 @@ class AlphaEngine(Engine):
             # Mark that the agent is ready to receive and respond to new events.
             await self._emit_ready_event(context, stage="completed")
             raise
+        finally:
+            # No-op on the happy path (collected before message generation);
+            # cancels orphans when the turn bails or unwinds early.
+            await self._discard_tool_announcements(context)
 
     async def _do_utter(
         self,
@@ -660,6 +669,7 @@ class AlphaEngine(Engine):
         if new_tool_events:
             context.state.tool_events += new_tool_events
             self._add_tool_events_to_tracer(new_tool_events)
+            await self._start_tool_announcement_task(context, new_tool_events)
 
         # Let the plan react to the tool call results.
         await plan.on_tools_called(context, tool_results)
@@ -770,6 +780,7 @@ class AlphaEngine(Engine):
         if new_tool_events:
             context.state.tool_events += new_tool_events
             self._add_tool_events_to_tracer(new_tool_events)
+            await self._start_tool_announcement_task(context, new_tool_events)
 
         # Let the plan react to the tool call results.
         await plan.on_tools_called(context, tool_results)
@@ -872,6 +883,67 @@ class AlphaEngine(Engine):
             context.state.message_events += [e for e in event_generation_result.events if e]
 
         return generated_messages
+
+    async def _start_tool_announcement_task(
+        self,
+        context: EngineContext,
+        tool_events: Sequence[EmittedEvent],
+    ) -> None:
+        policy = self._perceived_performance_policy_provider.get_policy(context.agent.id)
+
+        if not await policy.is_tool_call_announcement_required(context, tool_events):
+            return
+
+        # Announce only after execution so we never tell the customer about
+        # an operation that ends up not running. The generation runs
+        # concurrently with the rest of the turn and is collected in
+        # _collect_tool_announcements right before the response is composed.
+        context.state.tool_announcement_tasks.append(
+            asyncio.create_task(
+                self._get_message_composer(context.agent).generate_tool_call_announcement(
+                    context=context,
+                    tool_events=tool_events,
+                )
+            )
+        )
+
+    async def _collect_tool_announcements(self, context: EngineContext) -> None:
+        tasks = list(context.state.tool_announcement_tasks)
+        context.state.tool_announcement_tasks.clear()
+
+        if not tasks:
+            return
+
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            # The task list was already cleared, so the finally-discard in
+            # _do_process can't see these tasks — finalize them here.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        for result in results:
+            if isinstance(result, BaseException):
+                # The announcement is a nicety; never let it fail the turn.
+                self._logger.warning(f"Tool call announcement failed: {result}")
+                continue
+
+            for composition in result:
+                context.state.message_events += [e for e in composition.events if e]
+
+    async def _discard_tool_announcements(self, context: EngineContext) -> None:
+        tasks = list(context.state.tool_announcement_tasks)
+        context.state.tool_announcement_tasks.clear()
+
+        if not tasks:
+            return
+
+        for task in tasks:
+            task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _generate_messages(
         self,

@@ -164,6 +164,14 @@ class MessageGenerator(MessageEventComposer):
         return []
 
     @override
+    async def generate_tool_call_announcement(
+        self,
+        context: EngineContext,
+        tool_events: Sequence[EmittedEvent],
+    ) -> Sequence[MessageEventComposition]:
+        return []
+
+    @override
     async def generate_response(
         self,
         context: EngineContext,

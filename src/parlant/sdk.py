@@ -254,6 +254,7 @@ from parlant.core.engines.alpha.optimization_policy import (
     BasicOptimizationPolicy,
 )
 from parlant.core.engines.alpha.perceived_performance_policy import (
+    AnnouncingPerceivedPerformancePolicy,
     PerceivedPerformancePolicy,
     PerceivedPerformancePolicyProvider,
     NullPerceivedPerformancePolicy,
@@ -5685,6 +5686,7 @@ __all__ = [
     "Agent",
     "AgentId",
     "AllOf",
+    "AnnouncingPerceivedPerformancePolicy",
     "AnyOf",
     "AuthorizationException",
     "AuthorizationPolicy",
