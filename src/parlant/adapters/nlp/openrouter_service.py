@@ -86,6 +86,24 @@ class OpenRouterEmptyEmbeddingResponseError(Exception):
     """Raised when OpenRouter returns an embedding response with no vectors."""
 
 
+class EmptyCompletionError(json.JSONDecodeError):
+    """A 200 response that carried no completion content (empty/whitespace body).
+
+    Subclasses ``json.JSONDecodeError`` so ``SchematicGenerator.generate()``'s
+    retry loop — which catches ``(ValidationError, json.JSONDecodeError)`` — reasks,
+    instead of the old ``content or "{}"`` coercion that surfaced as a misleading
+    schema ``ValidationError`` (``Field required [input_value={}]``). An empty
+    completion is a transient model/provider event (e.g. a reasoning model cut off
+    before emitting a body), not a schema problem."""
+
+    def __init__(self, model_name: str, finish_reason: str | None) -> None:
+        self.model_name = model_name
+        self.finish_reason = finish_reason
+        super().__init__(
+            f"Empty completion from '{model_name}' (finish_reason={finish_reason})", "", 0
+        )
+
+
 def _create_openrouter_client() -> AsyncClient:
     """Create an OpenAI-compatible client for the OpenRouter API, including the
     optional attribution headers OpenRouter supports.
@@ -769,13 +787,19 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
         if response.usage:
             self.logger.trace(response.usage.model_dump_json(indent=2))
 
-        if not response.choices[0].message.content:
+        choice = response.choices[0] if response.choices else None
+        content = (choice.message.content if choice and choice.message else None) or ""
+        if not content.strip():
+            finish_reason = choice.finish_reason if choice else None
             self.logger.warning(
-                f"Empty response content from '{self.model_name}';"
-                f" treating it as an empty JSON object."
+                f"Empty completion from '{self.model_name}'"
+                f" (finish_reason={finish_reason}); raising retryable"
+                f" EmptyCompletionError so generate() reasks rather than"
+                f" failing schema validation on a synthesized '{{}}'."
             )
+            raise EmptyCompletionError(self.model_name, finish_reason)
 
-        raw_content = response.choices[0].message.content or "{}"
+        raw_content = content
 
         try:
             json_content = json.loads(normalize_json_output(raw_content))

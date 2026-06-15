@@ -27,6 +27,7 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.completion_usage import CompletionUsage, PromptTokensDetails
 
 from parlant.adapters.nlp.openrouter_service import (  # type: ignore[reportMissingImports]
+    EmptyCompletionError,
     OpenRouterService,
     OpenRouterSchematicGenerator,
     OpenRouterEmbedder,
@@ -788,6 +789,56 @@ async def test_that_openrouter_generator_raises_json_decode_error_when_response_
     with _openrouter_generator(container, create_side_effect=[mock_response]) as (generator, _):
         with pytest.raises(json.JSONDecodeError):
             await generator.do_generate("Some request")
+
+
+def _make_empty_completion(finish_reason: str = "length") -> Mock:
+    """A 200 response whose message carries no content (reasoning model cut off,
+    provider hiccup, etc.)."""
+    response = Mock(spec=ChatCompletion)
+    response.choices = [
+        Choice(
+            message=ChatCompletionMessage(role="assistant", content=None),
+            finish_reason=finish_reason,  # type: ignore[arg-type]
+            index=0,
+        )
+    ]
+    response.usage = CompletionUsage(prompt_tokens=10, completion_tokens=0, total_tokens=10)
+    return response
+
+
+async def test_that_openrouter_generator_raises_empty_completion_error_on_empty_content(
+    container: Container,
+) -> None:
+    """An empty 200 completion raises a retryable EmptyCompletionError (a
+    json.JSONDecodeError subclass), not a synthesized '{}' that fails schema
+    validation with a misleading 'Field required'."""
+    with _openrouter_generator(
+        container, create_side_effect=[_make_empty_completion(finish_reason="length")]
+    ) as (generator, _):
+        with pytest.raises(EmptyCompletionError) as exc_info:
+            await generator.do_generate("Some request")
+
+    # Subclassing JSONDecodeError is what keeps it inside generate()'s retry catch.
+    assert isinstance(exc_info.value, json.JSONDecodeError)
+    assert exc_info.value.finish_reason == "length"
+
+
+async def test_that_generate_reasks_empty_completions_then_raises(
+    container: Container,
+) -> None:
+    """generate() reasks on empty completions for schema_validation_retries + 1
+    attempts and surfaces EmptyCompletionError — proving the empty body is retried,
+    not swallowed."""
+    total_attempts = OpenRouterSchematicGenerator.schema_validation_retries + 1
+
+    with _openrouter_generator(
+        container,
+        create_side_effect=[_make_empty_completion() for _ in range(total_attempts)],
+    ) as (generator, mock_client):
+        with pytest.raises(EmptyCompletionError):
+            await generator.generate("Some request")
+
+    assert mock_client.chat.completions.create.await_count == total_attempts
 
 
 def test_that_openrouter_service_returns_correct_generator(container: Container) -> None:
