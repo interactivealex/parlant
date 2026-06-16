@@ -59,7 +59,6 @@ class ValidationStatus(Enum):
 
 class OverlappingToolsBatchArgumentEvaluation(DefaultBaseModel):
     parameter_name: str
-    acceptable_source_for_this_argument_according_to_its_tool_definition: str
     evaluate_is_it_provided_by_an_acceptable_source: str
     evaluate_was_it_already_provided_and_should_it_be_provided_again: str
     evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided: str
@@ -86,7 +85,6 @@ class OverlappingToolsBatchToolEvaluation(DefaultBaseModel):
 
 
 class OverlappingToolsBatchSchema(DefaultBaseModel):
-    last_customer_message: Optional[str] = None
     most_recent_customer_inquiry_or_need: Optional[str] = None
     most_recent_customer_inquiry_or_need_was_already_resolved: Optional[bool] = None
     tools_evaluation: list[OverlappingToolsBatchToolEvaluation]
@@ -536,7 +534,6 @@ OUTPUT FORMAT
 Given these tools, your output should adhere to the following format:
 ```json
 {{
-    "last_customer_message": "<REPEAT THE LAST USER MESSAGE IN THE INTERACTION>",
     "most_recent_customer_inquiry_or_need": "<CUSTOMER'S INQUIRY OR NEED>",
     "most_recent_customer_inquiry_or_need_was_already_resolved": <BOOL>,
     "tools_evaluation": [
@@ -553,7 +550,6 @@ Given these tools, your output should adhere to the following format:
                     "argument_evaluations": [
                         {{
                             "parameter_name": "<PARAMETER NAME>",
-                            "acceptable_source_for_this_argument_according_to_its_tool_definition": "<REPEAT THE ACCEPTABLE SOURCE FOR THE ARGUMENT FROM TOOL DEFINITION>",
                             "evaluate_is_it_provided_by_an_acceptable_source": "<BRIEFLY EVALUATE IF THE SOURCE FOR THE VALUE MATCHES THE ACCEPTABLE SOURCE>",
                             "evaluate_was_it_already_provided_and_should_it_be_provided_again": "<BRIEFLY EVALUATE IF THE PARAMETER VALUE WAS PROVIDED AND SHOULD BE PROVIDED AGAIN>",
                             "evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided": "<BRIEFLY EVALUATE IF IT'S A PROBLEM TO GUESS THE VALUE>",
@@ -735,7 +731,6 @@ example_1_shot = OverlappingToolsBatchShot(
         "the candidate tools are check_vehicle_price(model: str), check_motorcycle_price(model: str)"
     ),
     expected_result=OverlappingToolsBatchSchema(
-        last_customer_message="What's your price for a Harley-Davidson Street Glide?",
         most_recent_customer_inquiry_or_need="Checking the price of a Harley-Davidson Street Glide motorcycle",
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
         tools_evaluation=[
@@ -764,7 +759,6 @@ example_1_shot = OverlappingToolsBatchShot(
                         argument_evaluations=[
                             OverlappingToolsBatchArgumentEvaluation(
                                 parameter_name="model",
-                                acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                                 evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer asked about a specific model",
                                 evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer asked about a specific model",
                                 evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random model, but I don't need to guess here since the customer provided it",
@@ -787,7 +781,6 @@ example_2_shot = OverlappingToolsBatchShot(
         "the candidate tools are check_temperature(location: str), check_indoor_temperature(room: str)"
     ),
     expected_result=OverlappingToolsBatchSchema(
-        last_customer_message="What's the temperatures in the living room right now? And what is the temperature outside?",
         most_recent_customer_inquiry_or_need="Checking the current temperature in the living room and outside",
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
         tools_evaluation=[
@@ -806,7 +799,6 @@ example_2_shot = OverlappingToolsBatchShot(
                         argument_evaluations=[
                             OverlappingToolsBatchArgumentEvaluation(
                                 parameter_name="location",
-                                acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                                 evaluate_is_it_provided_by_an_acceptable_source="Yes, the user asked about the temperature outside, which implies a general outdoor location (e.g., 'outside')",
                                 evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer asked about a specific location",
                                 evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide information on some random place, but I don't need to guess here since the customer provided it",
@@ -835,7 +827,6 @@ example_2_shot = OverlappingToolsBatchShot(
                         argument_evaluations=[
                             OverlappingToolsBatchArgumentEvaluation(
                                 parameter_name="location",
-                                acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                                 evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer asked about a specific location",
                                 evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer asked about a specific location",
                                 evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random room, but I don't need to guess here since the customer provided it",

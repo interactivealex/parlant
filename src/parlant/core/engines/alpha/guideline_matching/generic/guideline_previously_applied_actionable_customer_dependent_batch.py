@@ -51,8 +51,6 @@ from parlant.core.shots import Shot, ShotCollection
 
 class GenericPreviouslyAppliedActionableCustomerDependentBatch(DefaultBaseModel):
     guideline_id: str
-    condition: str
-    action: str
     condition_still_met: bool
     customer_should_reply: Optional[bool] = None
     condition_met_again: Optional[bool] = None
@@ -343,8 +341,6 @@ OUTPUT FORMAT
         result_structure = [
             {
                 "guideline_id": i,
-                "condition": guideline_representations[g.id].condition,
-                "action": guideline_representations[g.id].action,
                 "condition_still_met": "<BOOL, whether the condition that raised the guideline still relevant in the most recent interaction and subject hasn't changed>",
                 "customer_should_reply": "<BOOL, include only if condition_still_met=True. whether the customer needs to apply their side of the action>",
                 "condition_met_again": "<BOOL, include only if customer_should_reply=False whether the condition is met again in the recent interaction for a new reason and action should be taken again>",
@@ -489,8 +485,6 @@ example_1_expected = GenericPreviouslyAppliedActionableCustomerDependentGuidelin
     checks=[
         GenericPreviouslyAppliedActionableCustomerDependentBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The customer wants recommendations for a trip",
-            action="Ask for their preferred activities and recommend accordingly",
             condition_still_met=True,
             customer_should_reply=True,
             tldr="The customer should answer what's their preferred activities.",
@@ -523,8 +517,6 @@ example_2_expected = GenericPreviouslyAppliedActionableCustomerDependentGuidelin
     checks=[
         GenericPreviouslyAppliedActionableCustomerDependentBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The customer wants recommendations for a trip",
-            action="Ask for their preferred activities and recommend accordingly",
             condition_still_met=True,
             customer_should_reply=False,
             condition_met_again=False,
@@ -563,8 +555,6 @@ example_3_expected = GenericPreviouslyAppliedActionableCustomerDependentGuidelin
     checks=[
         GenericPreviouslyAppliedActionableCustomerDependentBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The customer wants recommendations for a trip",
-            action="Ask for their preferred activities and recommend accordingly",
             condition_still_met=True,
             customer_should_reply=False,
             condition_met_again=True,
@@ -612,8 +602,6 @@ example_4_expected = GenericPreviouslyAppliedActionableCustomerDependentGuidelin
     checks=[
         GenericPreviouslyAppliedActionableCustomerDependentBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The customer wants recommendations for a trip",
-            action="Ask for their preferred activities and recommend accordingly",
             condition_still_met=True,
             customer_should_reply=True,
             tldr="The customer didn't answer the question.",
@@ -657,8 +645,6 @@ example_5_expected = GenericPreviouslyAppliedActionableCustomerDependentGuidelin
     checks=[
         GenericPreviouslyAppliedActionableCustomerDependentBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The customer wants recommendations for a trip",
-            action="Ask for their preferred activities and recommend accordingly",
             condition_still_met=False,
             tldr="The customer regret about the new planning",
             should_apply=False,
@@ -694,8 +680,6 @@ example_6_expected = GenericPreviouslyAppliedActionableCustomerDependentGuidelin
     checks=[
         GenericPreviouslyAppliedActionableCustomerDependentBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The customer is asking for account-related help",
-            action="Ask for their account ID to verify their identity",
             condition_still_met=True,
             customer_should_reply=False,
             condition_met_again=True,

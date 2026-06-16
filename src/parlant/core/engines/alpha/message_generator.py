@@ -53,7 +53,6 @@ from parlant.core.emissions import EmittedEvent, EventEmitter
 from parlant.core.sessions import (
     Event,
     EventKind,
-    EventSource,
     Session,
 )
 from parlant.core.common import DefaultBaseModel
@@ -114,7 +113,6 @@ class InstructionEvaluation(DefaultBaseModel):
 
 
 class MessageSchema(DefaultBaseModel):
-    last_message_of_customer: Optional[str] = None
     produced_reply: Optional[bool] = None
     produced_reply_rationale: Optional[str] = None
     guidelines: Optional[list[str]] = None
@@ -396,7 +394,6 @@ The interaction with the customer has just began, and no messages were sent by e
 If told so by a guideline or some other contextual condition, send the first message. Otherwise, do not produce a reply.
 If you decide not to emit a message, output the following:
 {{
-    "last_message_of_customer": None,
     "produced_reply": false,
     "guidelines": [<list of strings- a FEW-WORD gist of each applicable guideline's condition. Do NOT restate guidelines in full; the full text is already above and restating it wastes time>],
     "context_evaluation": None,
@@ -635,28 +632,19 @@ Produce a valid JSON object in the following format: ###
         guidelines: Sequence[GuidelineMatch],
         guideline_representations: dict[GuidelineId, GuidelineInternalRepresentation],
     ) -> str:
-        last_customer_message = next(
-            (
-                event.data["message"] if not event.data.get("flagged", False) else "<N/A>"
-                for event in reversed(interaction_history)
-                if (
-                    event.kind == EventKind.MESSAGE
-                    and event.source == EventSource.CUSTOMER
-                    and isinstance(event.data, dict)
-                )
-            ),
-            "",
-        )
         guidelines_list_text = ", ".join(
             f'"{guideline_gist(rep.condition, rep.action)}"'
             for rep in (guideline_representations[g.guideline.id] for g in guidelines)
         )
+        # `instruction` is the action to follow, so gist the action (primary),
+        # falling back to the condition for agent-intention guidelines that have
+        # no action — the reverse priority of the condition-first list above.
         guidelines_output_format = "\n".join(
             [
                 f"""
         {{
             "number": {i},
-            "instruction": "{guideline_representations[g.guideline.id].action}",
+            "instruction": "{guideline_gist(guideline_representations[g.guideline.id].action or "", guideline_representations[g.guideline.id].condition)}",
             "evaluation": "<your evaluation of how the guideline should be followed>",
             "data_available": "<explanation whether you are provided with the required data to follow this guideline now>"
         }},"""
@@ -694,7 +682,6 @@ Produce a valid JSON object in the following format: ###
         return f"""{gist_note}
 ```json
 {{
-    "last_message_of_customer": "{last_customer_message}",
     "produced_reply": "<BOOL, should be true unless the customer explicitly asked you not to respond>",
     "produced_reply_rationale": "<str, optional. required only if produced_reply is false>",
     "guidelines": [{guidelines_list_text}],
@@ -808,7 +795,6 @@ Produce a valid JSON object in the following format: ###
 
 
 example_1_expected = MessageSchema(
-    last_message_of_customer="Hi, I'd like to know the schedule for the next trains to Boston, please.",
     produced_reply=True,
     guidelines=["the customer asks for train schedules"],
     context_evaluation=ContextEvaluation(
@@ -826,19 +812,19 @@ example_1_expected = MessageSchema(
     evaluation_for_each_instruction=[
         InstructionEvaluation(
             number=1,
-            instruction="When the customer asks for train schedules, provide them accurately and concisely.",
+            instruction="provide train schedules accurately",
             evaluation="The customer requested train schedules, so I need to respond with accurate timing information.",
             data_available="Yes, the train schedule data is available.",
         ),
         InstructionEvaluation(
             number=2,
-            instruction="Use markdown format when applicable.",
+            instruction="use markdown format",
             evaluation="Markdown formatting makes the schedule clearer and more readable.",
             data_available="Not specifically needed, but markdown format can be applied to any response.",
         ),
         InstructionEvaluation(
             number=3,
-            instruction="Provide the train schedule without specifying which trains are *next*.",
+            instruction="omit which trains are next",
             evaluation="I don't want to mislead the user so, while I can provide the schedule, I should be clear that I don't know which trains are next",
             data_available="I have the schedule itself, so I can conform to this instruction.",
         ),
@@ -864,12 +850,10 @@ example_1_expected = MessageSchema(
                 ),
             ],
             offered_services=[],
-            instructions_followed=[
-                "#1; When the customer asks for train schedules, provide them accurately and concisely."
-            ],
+            instructions_followed=["#1; provide train schedules accurately"],
             instructions_broken=[
-                "#2; Did not use markdown format when applicable.",
-                "#3; Was not clear enough that I don't know which trains are next because I don't have the time",
+                "#2; did not use markdown format",
+                "#3; not clear I don't know which trains are next",
             ],
             is_repeat_message=False,
             followed_all_instructions=False,
@@ -903,9 +887,9 @@ example_1_expected = MessageSchema(
             ],
             offered_services=[],
             instructions_followed=[
-                "#1; When the customer asks for train schedules, provide them accurately and concisely.",
-                "#2; Use markdown format when applicable.",
-                "#3; Clearly stated that I can't guarantee which trains are next as I don't have the time.",
+                "#1; provide train schedules accurately",
+                "#2; use markdown format",
+                "#3; stated can't guarantee which trains are next",
             ],
             instructions_broken=[],
             is_repeat_message=False,
@@ -923,7 +907,6 @@ example_1_shot = MessageGeneratorShot(
 
 
 example_2_expected = MessageSchema(
-    last_message_of_customer="Alright, can I get the American burger with cheese?",
     guidelines=[
         "the customer chooses and orders a burger",
         "the customer chooses specific ingredients on the burger",
@@ -941,19 +924,19 @@ example_2_expected = MessageSchema(
     evaluation_for_each_instruction=[
         InstructionEvaluation(
             number=1,
-            instruction="When the customer chooses and orders a burger, then provide it",
+            instruction="provide the burger",
             evaluation="This guideline currently applies, so I need to provide the customer with a burger.",
             data_available="The burger choice is available in the interaction",
         ),
         InstructionEvaluation(
             number=2,
-            instruction="When the customer chooses specific ingredients on the burger, only provide those ingredients if we have them fresh in stock; otherwise, reject the order.",
+            instruction="only serve fresh toppings; reject if out of stock",
             evaluation="The customer chose cheese on the burger, but all of the cheese we currently have is expired",
             data_available="The relevant stock availability is given in the tool calls' data. Our cheese has expired.",
         ),
         InstructionEvaluation(
             number=3,
-            instruction="When you processes a new order, confirm with the customer the order details and the price",
+            instruction="confirm order details and price",
             evaluation="The agent is not going to process the order, so no need to make a confirmation",
             data_available="No relevant data",
         ),
@@ -978,11 +961,9 @@ example_2_expected = MessageSchema(
                     is_source_based_in_this_prompt=True,
                 ),
             ],
-            instructions_followed=[
-                "#2; upheld food quality and did not go on to preparing the burger without fresh toppings."
-            ],
+            instructions_followed=["#2; upheld food quality, did not serve expired toppings"],
             instructions_broken=[
-                "#1; did not provide the burger with requested toppings immediately due to the unavailability of fresh ingredients."
+                "#1; did not provide the burger due to unavailable fresh ingredients"
             ],
             is_repeat_message=False,
             followed_all_instructions=False,
@@ -1005,7 +986,6 @@ example_2_shot = MessageGeneratorShot(
 
 
 example_3_expected = MessageSchema(
-    last_message_of_customer="Hi there, can I get something to drink? What do you have on tap?",
     guidelines=["the customer asks for a drink"],
     context_evaluation=ContextEvaluation(
         most_recent_customer_inquiries_or_needs="Knowing what drinks we have on tap",
@@ -1021,13 +1001,13 @@ example_3_expected = MessageSchema(
     evaluation_for_each_instruction=[
         InstructionEvaluation(
             number=1,
-            instruction="When the customer asks for a drink, check the menu and offer what's on it",
+            instruction="check menu and offer drinks",
             evaluation="The customer did ask for a drink, so I should check the menu to see what's available.",
             data_available="No, I don't have the menu info in the interaction or tool calls",
         ),
         InstructionEvaluation(
             number=2,
-            instruction="Do not state factual information that you do not know or are not sure about",
+            instruction="don't state unknown facts",
             evaluation="There's no information about what we have on tap, so I should not offer any specific option.",
             data_available="No, the list of available drinks is not available to me",
         ),
@@ -1046,12 +1026,8 @@ example_3_expected = MessageSchema(
                 ),
             ],
             offered_services=[],
-            instructions_followed=[
-                "#2; Do not state factual information that you do not know or are not sure about"
-            ],
-            instructions_broken=[
-                "#1; Lacking menu data in the context prevented me from providing the client with drink information."
-            ],
+            instructions_followed=["#2; don't state unknown facts"],
+            instructions_broken=["#1; couldn't provide drinks, no menu data available"],
             is_repeat_message=False,
             followed_all_instructions=False,
             missing_data_rationale="Menu data was missing",
@@ -1070,7 +1046,6 @@ example_3_shot = MessageGeneratorShot(
 
 
 example_4_expected = MessageSchema(
-    last_message_of_customer="This is not what I was asking for",
     guidelines=[],
     context_evaluation=ContextEvaluation(
         most_recent_customer_inquiries_or_needs="At this point it appears that I do not understand what the customer is asking",
@@ -1079,7 +1054,7 @@ example_4_expected = MessageSchema(
     evaluation_for_each_instruction=[
         InstructionEvaluation(
             number=1,
-            instruction="I should not keep repeating myself as it makes me sound robotic",
+            instruction="avoid repeating myself",
             evaluation="If I keep repeating myself in asking for clarifications, it makes me sound robotic and unempathetic as if I'm not really tuned into the customer's vibe",
             data_available="None needed",
         )
@@ -1091,9 +1066,7 @@ example_4_expected = MessageSchema(
             factual_information_provided=[],
             offered_services=[],
             instructions_followed=[],
-            instructions_broken=[
-                "#1; I've already apologized and asked for clarifications, and I shouldn't repeat myself"
-            ],
+            instructions_broken=["#1; already asked for clarifications, repeating myself"],
             is_repeat_message=True,
             followed_all_instructions=False,
             all_facts_and_services_sourced_from_prompt=True,
@@ -1105,9 +1078,7 @@ example_4_expected = MessageSchema(
             factual_information_provided=[],
             offered_services=[],
             instructions_followed=[],
-            instructions_broken=[
-                "#1; Asking what I'm missing is still asking for clarifications, and I shouldn't repeat myself"
-            ],
+            instructions_broken=["#1; asking what I'm missing is still asking for clarifications"],
             is_repeat_message=True,
             followed_all_instructions=False,
             all_facts_and_services_sourced_from_prompt=True,
@@ -1121,9 +1092,7 @@ example_4_expected = MessageSchema(
             ),
             factual_information_provided=[],
             offered_services=[],
-            instructions_followed=[
-                "#1; I broke of out of the self-repeating loop by admitting that I can't seem to help"
-            ],
+            instructions_followed=["#1; broke out of loop by admitting I can't help"],
             instructions_broken=[],
             is_repeat_message=False,
             followed_all_instructions=True,
@@ -1140,10 +1109,6 @@ example_4_shot = MessageGeneratorShot(
 
 
 example_5_expected = MessageSchema(
-    last_message_of_customer=(
-        "How much money do I have in my account, and how do you know it? Is there some service you use to check "
-        "my balance? Can I access it too?"
-    ),
     guidelines=["you need the balance of a customer"],
     context_evaluation=ContextEvaluation(
         most_recent_customer_inquiries_or_needs="Know how much money they have in their account; Knowing how and what I use to know how much money they have",
@@ -1157,13 +1122,13 @@ example_5_expected = MessageSchema(
     evaluation_for_each_instruction=[
         InstructionEvaluation(
             number=1,
-            instruction="use the 'check_balance' tool",
+            instruction="use check_balance tool",
             evaluation="There's already a staged tool call with this tool, so no further action is required.",
             data_available="Yes, I know that the customer's balance is 1,000$",
         ),
         InstructionEvaluation(
             number=1,
-            instruction="Never reveal details about the process you followed to produce your response",
+            instruction="don't reveal internal process",
             evaluation="The reply must not reveal details about how I know the client's balance",
             data_available="Not needed",
         ),
@@ -1185,8 +1150,8 @@ example_5_expected = MessageSchema(
             ],
             offered_services=[],
             instructions_followed=[
-                "#1; use the 'check_balance' tool",
-                "#2; Never reveal details about the process you followed to produce your response",
+                "#1; use check_balance tool",
+                "#2; don't reveal internal process",
             ],
             instructions_broken=[],
             is_repeat_message=False,
@@ -1204,15 +1169,12 @@ example_5_shot = MessageGeneratorShot(
 
 
 example_6_expected = MessageSchema(
-    last_message_of_customer=(
-        "Alright I have the documents ready, how can I send them to you guys?"
-    ),
     guidelines=[],
     insights=[],
     evaluation_for_each_instruction=[
         InstructionEvaluation(
             number=1,
-            instruction="ONLY OFFER SERVICES AND INFORMATION PROVIDED IN THIS PROMPT",
+            instruction="only offer prompt-provided info",
             evaluation="I must not output any contact information, since it was not provided within this prompt.",
             data_available="Contact info is not available",
         ),
@@ -1239,7 +1201,7 @@ example_6_expected = MessageSchema(
                 ),
             ],
             instructions_followed=[],
-            instructions_broken=["#1; ONLY OFFER SERVICES AND INFORMATION PROVIDED IN THIS PROMPT"],
+            instructions_broken=["#1; offered info not in the prompt"],
             is_repeat_message=False,
             followed_all_instructions=False,
             all_facts_and_services_sourced_from_prompt=False,
@@ -1252,9 +1214,7 @@ example_6_expected = MessageSchema(
             ),
             factual_information_provided=[],
             offered_services=[],
-            instructions_followed=[
-                "#1; ONLY OFFER SERVICES AND INFORMATION PROVIDED IN THIS PROMPT"
-            ],
+            instructions_followed=["#1; only offered prompt-provided info"],
             instructions_broken=[],
             is_repeat_message=False,
             followed_all_instructions=False,
@@ -1272,7 +1232,6 @@ example_6_shot = MessageGeneratorShot(
 )
 
 example_7_expected = MessageSchema(
-    last_message_of_customer=("Hey, how can I contact customer support?"),
     guidelines=[],
     context_evaluation=ContextEvaluation(
         most_recent_customer_inquiries_or_needs="The customer wants to know how to contact customer support",
@@ -1286,7 +1245,7 @@ example_7_expected = MessageSchema(
     evaluation_for_each_instruction=[
         InstructionEvaluation(
             number=1,
-            instruction="When I cannot help with a topic, I should tell the customer I can't help with it",
+            instruction="tell customer when I can't help",
             evaluation="Indeed, no information on contacting customer support is provided in my context",
             data_available="Not needed",
         ),
@@ -1301,7 +1260,7 @@ example_7_expected = MessageSchema(
             offered_services=[],
             instructions_followed=[],
             instructions_broken=[
-                "#1; Instead of saying I can't help, I asked for more details from the customer",
+                "#1; asked for details instead of saying I can't help",
             ],
             is_repeat_message=False,
             followed_all_instructions=False,
@@ -1316,7 +1275,7 @@ example_7_expected = MessageSchema(
             factual_information_provided=[],
             offered_services=[],
             instructions_followed=[
-                "#1; I adhered to the instruction by clearly stating that I cannot help with this topic",
+                "#1; clearly stated I can't help with this topic",
             ],
             instructions_broken=[],
             is_repeat_message=False,
@@ -1334,7 +1293,6 @@ example_7_shot = MessageGeneratorShot(
 
 
 example_8_expected = MessageSchema(
-    last_message_of_customer="I don't have any android devices, and I do not want to buy a ticket at the moment. Now, what flights are there from New York to Los Angeles tomorrow?",
     guidelines=[
         "When asked anything about plane tickets, suggest completing the order on our android app",
         "When asked about first-class tickets, mention that shorter flights do not offer a complementary meal",
@@ -1354,25 +1312,25 @@ example_8_expected = MessageSchema(
     evaluation_for_each_instruction=[
         InstructionEvaluation(
             number=1,
-            instruction="When asked anything about plane tickets, suggest completing the order on our android app",
+            instruction="suggest completing order on android app",
             evaluation="I should suggest completing the order on our android app",
             data_available="Yes, I know that the name of our android app is BestPlaneTickets",
         ),
         InstructionEvaluation(
             number=2,
-            instruction="When asked about first-class tickets, mention that shorter flights do not offer a complementary meal",
+            instruction="mention no meal on short first-class flights",
             evaluation="Evaluating whether the 'when' condition applied is not my role. I should therefore just mention that shorter flights do not offer a complementary meal",
             data_available="not needed",
         ),
         InstructionEvaluation(
             number=3,
-            instruction="In your generated reply to the customer, use markdown format when applicable",
+            instruction="use markdown format",
             evaluation="I need to output a message in markdown format",
             data_available="Not needed",
         ),
         InstructionEvaluation(
             number=4,
-            instruction="The customer does not have an android device and does not want to buy anything",
+            instruction="customer has no android, doesn't want to buy",
             evaluation="A guideline should not override a customer's request, so I should not suggest products requiring an android device",
             data_available="Not needed",
         ),
@@ -1402,13 +1360,11 @@ example_8_expected = MessageSchema(
             ],
             offered_services=[],
             instructions_followed=[
-                "#2; When asked about first-class tickets, mention that shorter flights do not offer a complementary meal",
-                "#3; In your generated reply to the customer, use markdown format when applicable.",
-                "#4; The customer does not have an android device and does not want to buy anything",
+                "#2; mentioned no meal on short first-class flights",
+                "#3; used markdown format",
+                "#4; customer has no android, didn't push android app",
             ],
-            instructions_broken=[
-                "#1; When asked anything about plane tickets, suggest completing the order on our android app."
-            ],
+            instructions_broken=["#1; did not suggest completing order on android app"],
             is_repeat_message=False,
             followed_all_instructions=False,
             instructions_broken_only_due_to_prioritization=True,
@@ -1429,7 +1385,6 @@ example_8_shot = MessageGeneratorShot(
 )
 
 example_9_expected = MessageSchema(
-    last_message_of_customer=("You are not being helpful. Transfer me to a human."),
     guidelines=[],
     context_evaluation=ContextEvaluation(
         most_recent_customer_inquiries_or_needs="The customer wants to be transferred to a human",
@@ -1445,7 +1400,7 @@ example_9_expected = MessageSchema(
     evaluation_for_each_instruction=[
         InstructionEvaluation(
             number=1,
-            instruction="The customer is dissatisfied with my service, meaning I should apologize and attempt to assist them with their issue",
+            instruction="apologize and attempt to assist dissatisfied customer",
             evaluation="I should apologize and attempt to mitigate the issue",
             data_available="Not needed",
         ),
@@ -1464,9 +1419,7 @@ example_9_expected = MessageSchema(
                     is_source_based_in_this_prompt=False,
                 )
             ],
-            instructions_followed=[
-                "#1; The customer is dissatisfied with my service, meaning I should apologize and attempt to assist them with their issue"
-            ],
+            instructions_followed=["#1; apologized and attempted to assist"],
             instructions_broken=[],
             is_repeat_message=False,
             followed_all_instructions=True,
@@ -1486,9 +1439,7 @@ example_9_expected = MessageSchema(
                     is_source_based_in_this_prompt=False,
                 )
             ],
-            instructions_followed=[
-                "#1; The customer is dissatisfied with my service, meaning I should apologize and attempt to assist them with their issue"
-            ],
+            instructions_followed=["#1; apologized and attempted to assist"],
             instructions_broken=[],
             is_repeat_message=False,
             followed_all_instructions=True,
@@ -1498,7 +1449,7 @@ example_9_expected = MessageSchema(
         Revision(
             revision_number=2,
             content=(
-                "I'm really sorry I couldn’t provide the help you needed. Unfortunately, I don’t have the option to transfer you to a human representative. If there’s anything else I can try to assist with, feel free to let me know."
+                "I’m really sorry I couldn’t provide the help you needed. Unfortunately, I don’t have the option to transfer you to a human representative. If there’s anything else I can try to assist with, feel free to let me know."
             ),
             factual_information_provided=[],
             offered_services=[
@@ -1509,9 +1460,7 @@ example_9_expected = MessageSchema(
                 )
             ],
             instructions_followed=[],
-            instructions_broken=[
-                "#1; The customer is dissatisfied with my service, meaning I should apologize and attempt to assist them with their issue"
-            ],
+            instructions_broken=["#1; could not assist the dissatisfied customer"],
             is_repeat_message=False,
             followed_all_instructions=False,
             instructions_broken_due_to_missing_data=True,
@@ -1529,7 +1478,6 @@ example_9_shot = MessageGeneratorShot(
 
 
 example_10_expected = MessageSchema(
-    last_message_of_customer=("I want to return my shoes, I purchased them a month ago"),
     guidelines=[
         "When you suggests refund options, suggest a refund either as website credit or to their credit card.",
         "When the customer wants to return an item they purchased more than a week ago, do not suggest a refund to the credit card",
@@ -1546,19 +1494,19 @@ example_10_expected = MessageSchema(
     evaluation_for_each_instruction=[
         InstructionEvaluation(
             number=1,
-            instruction="do not suggest a refund to the credit card",
-            evaluation="It's been purchased more than a week ago so can't offer return to credit card",
+            instruction="no credit card refund for late returns",
+            evaluation="It’s been purchased more than a week ago so can’t offer return to credit card",
             data_available="Not needed",
         ),
         InstructionEvaluation(
             number=2,
-            instruction="suggest a refund either as website credit or to their credit card.",
+            instruction="offer website credit or credit card refund",
             evaluation="Refunds are usually to credit or card. Since this purchase was over a week ago, I’ll offer website credit",
             data_available="Not needed",
         ),
         InstructionEvaluation(
             number=3,
-            instruction="The customer purchased the item over a week ago",
+            instruction="purchased over a week ago",
             evaluation="As mentioned by the user they purchased more than a week ago, so the more restrictive refund option should apply",
             data_available="Not needed",
         ),
@@ -1578,9 +1526,9 @@ example_10_expected = MessageSchema(
                 )
             ],
             instructions_followed=[
-                "#1; do not suggest a refund to the credit card",
-                "#2; suggest a refund either as website credit or to their credit card",
-                "#3; The customer purchased the item over a week ago",
+                "#1; no credit card refund for late returns",
+                "#2; offered website credit refund",
+                "#3; purchased over a week ago",
             ],
             instructions_broken=[],
             is_repeat_message=False,

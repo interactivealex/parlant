@@ -86,7 +86,6 @@ class JourneyNodeAdvancement(DefaultBaseModel):
 
 class JourneyBacktrackNodeSelectionSchema(DefaultBaseModel):
     rationale: str | None = None
-    journey_applies: bool | None = None
     requires_backtracking: bool | None = None
     backtracking_target_step: str | None = None
     step_advancement: Sequence[JourneyNodeAdvancement] | None = None
@@ -719,11 +718,11 @@ Follow this process to determine the next journey step. Document each decision i
 Determine if the conversation should continue within the current journey.
 Once a journey has begun, continue following it unless the customer explicitly indicates they no longer want to pursue the journey's original goal.
 
-Set journey_applies to true unless the customer explicitly requests to leave the topic or abandon the journey's goal entirely.
+The journey continues unless the customer explicitly requests to leave the topic or abandon the journey's goal entirely.
 The journey condition is for initial activation - once activated, continue even if individual steps seem unrelated to the original condition.
-The journey still applies when the customer is responding to questions, engaging with the journey flow, or providing information requested by previous steps, even if their responses seem tangential to the original condition
-Only set journey_applies to false if the customer clearly states they want to exit (e.g., "I don't want to reset my password anymore" or "Let's talk about something else")
-If journey_applies is false, set next_step to 'None' and skip remaining steps
+The journey still applies when the customer is responding to questions, engaging with the journey flow, or providing information requested by previous steps, even if their responses seem tangential to the original condition.
+Only exit the journey if the customer clearly states they want to exit (e.g., "I don't want to reset my password anymore" or "Let's talk about something else").
+If the journey should end, set next_step to 'None' and skip remaining steps.
 
 CRITICAL: If you are already executing journey steps (i.e., there is a "last_step"), the journey almost always continues. The activation condition is ONLY for starting new journeys, NOT for validating ongoing ones.
 
@@ -829,7 +828,6 @@ OUTPUT FORMAT
 ```json
 {{
   "rationale": "<str, explanation for what is the next step and why it was selected>",
-  "journey_applies": <bool, whether the journey should continued. Reminder: If you are already executing journey steps (i.e., there is a "last_step"), the journey almost always continues. The activation condition is ONLY for starting new journeys, NOT for validating ongoing ones.>,
   "requires_backtracking": <bool, does the agent need to backtrack to a previous step?>,
   "backtracking_target_step": "<str, id of the step where the customer's decision changed. Omit this field if requires_backtracking is false>",
   "step_advancement": [
@@ -957,7 +955,6 @@ example_1_journey_nodes = {
 
 
 example_1_expected = JourneyBacktrackNodeSelectionSchema(
-    journey_applies=True,
     requires_backtracking=False,
     rationale="The last step was completed. Customer asks about visas, which is unrelated to exploring cities, so step 4 should be activated",
     step_advancement=[
@@ -1238,7 +1235,6 @@ random_actions_journey_nodes = {
 }
 
 example_2_expected = JourneyBacktrackNodeSelectionSchema(
-    journey_applies=True,
     rationale="The customer provided a pick up location in NYC, a destination and a pick up time, allowing me to fast-forward through steps 2, 3, 5. I must stop at the next step, 6, because it requires tool calling.",
     requires_backtracking=False,
     step_advancement=[
@@ -1266,7 +1262,6 @@ example_3_events = [
 ]
 
 example_3_expected = JourneyBacktrackNodeSelectionSchema(
-    journey_applies=True,
     rationale="The customer provided a pick up location in NYC and a destination, allowing us to fast-forward through steps 1, 2 and 3. Step 5 requires asking for a pick up time, which the customer has yet to provide. We must therefore activate step 5.",
     requires_backtracking=False,
     step_advancement=[
@@ -1357,7 +1352,6 @@ example_4_events = [
 ]
 
 example_4_expected = JourneyBacktrackNodeSelectionSchema(
-    journey_applies=True,
     requires_backtracking=True,
     rationale="The customer is changing their pickup location decision that was made in step 2. The relevant follow up is step 3, since the new requested location is within NYC.",
     backtracking_target_step="2",
@@ -1399,7 +1393,6 @@ example_5_events = [
 ]
 
 example_5_expected = JourneyBacktrackNodeSelectionSchema(
-    journey_applies=True,
     rationale="Customer was told about capitals. Now we need to advance to the following step and ask for money",
     requires_backtracking=False,
     step_advancement=[
@@ -1647,7 +1640,6 @@ loan_journey_nodes = {
 }
 
 example_6_expected = JourneyBacktrackNodeSelectionSchema(
-    journey_applies=True,
     requires_backtracking=True,
     rationale="The customer changed their loan type decision after providing all information. The journey backtracks to the loan type step (2), then fast-forwards through the business loan path using the provided information, and eventually exits the journey.",
     backtracking_target_step="2",
@@ -1720,7 +1712,6 @@ example_7_events = [
 ]
 
 example_7_expected = JourneyBacktrackNodeSelectionSchema(
-    journey_applies=True,
     requires_backtracking=False,
     rationale="The customer wants a loan for their restaurant, making it a business loan. We can proceed through steps 4 and 6, since the customer already specified their desired loan amount and the collateral for the loan. This brings us to step 8, which was not completed yet.",
     step_advancement=[

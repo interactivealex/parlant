@@ -106,10 +106,8 @@ def _format_guideline(condition: str, action: str) -> str:
 
 
 class CannedResponseDraftSchema(DefaultBaseModel):
-    last_message_of_user: Optional[str]
     guidelines: Optional[list[str]] = None
     insights: Optional[list[str]] = None
-    response_preamble_that_was_already_sent: Optional[str] = None
     response_body: Optional[str] = None
 
 
@@ -1590,10 +1588,8 @@ The interaction with the user has just began, and no messages were sent by eithe
 If told so by a guideline or some other contextual condition, send the first message. Otherwise, do not produce a reply (canned response is null).
 If you decide not to emit a message, output the following:
 {{
-    "last_message_of_user": "<user's last message>",
     "guidelines": [<list of strings- a FEW-WORD gist of each applicable guideline's condition. Do NOT restate guidelines in full; the full text is already above and restating it wastes time>],
     "insights": [<list of strings- up to 3 original insights>],
-    "response_preamble_that_was_already_sent": null,
     "response_body": null
 }}
 Otherwise, follow the rest of this prompt to choose the content of your response.
@@ -1771,41 +1767,6 @@ Produce a valid JSON object according to the following spec. Use the values prov
         interaction_history: Sequence[Event],
         guidelines: Sequence[GuidelineMatch],
     ) -> str:
-        last_user_message_event = next(
-            (
-                event
-                for event in reversed(interaction_history)
-                if (event.kind == EventKind.MESSAGE and event.source == EventSource.CUSTOMER)
-            ),
-            None,
-        )
-
-        agent_preamble = ""
-
-        if event := last_user_message_event:
-            event_data = cast(MessageEventData, event.data)
-
-            last_user_message = (
-                event_data["message"]
-                if not event_data.get("flagged", False)
-                else "<N/A -- censored>"
-            )
-
-            agent_preamble = next(
-                (
-                    cast(MessageEventData, event.data)["message"]
-                    for event in reversed(interaction_history)
-                    if (
-                        event.kind == EventKind.MESSAGE
-                        and event.source == EventSource.AI_AGENT
-                        and event.offset > last_user_message_event.offset
-                    )
-                ),
-                "",
-            )
-        else:
-            last_user_message = ""
-
         guidelines_list_items = []
         for g in guidelines:
             internal_rep = internal_representation(g.guideline)
@@ -1830,11 +1791,9 @@ Produce a valid JSON object according to the following spec. Use the values prov
 
         return f"""{gist_note}
 {{
-    "last_message_of_user": "{last_user_message}",
     "guidelines": [{guidelines_list_text}],
     "insights": [<Up to 3 original insights to adhere to>],
-    "response_preamble_that_was_already_sent": "{agent_preamble}",
-    "response_body": "<response message text (that would immediately follow the preamble)>"
+    "response_body": "<response message text>"
 }}
 ###"""
 
@@ -2938,7 +2897,6 @@ def shot_canned_canned_response_id(number: int) -> str:
 
 
 draft_generation_example_1_expected = CannedResponseDraftSchema(
-    last_message_of_user="Hi, I'd like an onion cheeseburger please.",
     guidelines=[
         "the user chooses and orders a burger",
         "the user chooses specific ingredients on the burger",
@@ -2947,7 +2905,6 @@ draft_generation_example_1_expected = CannedResponseDraftSchema(
         "As appears in the tool results, all of our cheese has expired and is currently out of stock",
         "The user is a long-time user and we should treat him with extra respect",
     ],
-    response_preamble_that_was_already_sent="Let me check",
     response_body="Unfortunately we're out of cheese. Would you like anything else instead?",
 )
 
@@ -2959,13 +2916,11 @@ draft_generation_example_1_shot = CannedResponseGeneratorDraftShot(
 
 
 draft_generation_example_2_expected = CannedResponseDraftSchema(
-    last_message_of_user="Hi there, can I get something to drink? What do you have on tap?",
     guidelines=["the user asks for a drink"],
     insights=[
         "According to contextual information about the user, this is their first time here",
         "There's no menu information in my context",
     ],
-    response_preamble_that_was_already_sent="Just a moment",
     response_body="I'm sorry, but I'm having trouble accessing our menu at the moment. This isn't a great first impression! Can I possibly help you with anything else?",
 )
 
@@ -2981,12 +2936,10 @@ draft_generation_example_2_shot = CannedResponseGeneratorDraftShot(
 
 
 draft_generation_example_3_expected = CannedResponseDraftSchema(
-    last_message_of_user=("Hey, how can I contact customer support?"),
     guidelines=[],
     insights=[
         "When I cannot help with a topic, I should tell the user I can't help with it",
     ],
-    response_preamble_that_was_already_sent="Hello",
     response_body="Unfortunately, I cannot refer you to live customer support. Is there anything else I can help you with?",
 )
 

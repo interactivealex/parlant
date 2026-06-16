@@ -818,7 +818,7 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
                 raise decode_error
 
         try:
-            content = self.schema.model_validate(json_content)
+            validated_content = self.schema.model_validate(json_content)
         except ValidationError as e:
             self.logger.error(
                 f"\nJSON content returned by '{self.model_name}' does not match expected schema.\n"
@@ -857,7 +857,7 @@ class OpenRouterSchematicGenerator(BaseSchematicGenerator[T]):
         )
 
         return SchematicGenerationResult(
-            content=content,
+            content=validated_content,
             info=GenerationInfo(
                 schema_name=self.schema.__name__,
                 model=self.id,

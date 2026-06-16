@@ -83,7 +83,6 @@ class NonConsequentialSingleToolBatchShot(Shot):
 
 class SingleToolBatchArgumentEvaluation(DefaultBaseModel):
     parameter_name: str
-    acceptable_source_for_this_argument_according_to_its_tool_definition: str
     evaluate_is_it_provided_by_an_acceptable_source: str
     evaluate_was_it_already_provided_and_should_it_be_provided_again: str
     evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided: str
@@ -116,10 +115,8 @@ class SingleToolBatchToolCallEvaluation(DefaultBaseModel):
 
 
 class SingleToolBatchSchema(DefaultBaseModel):
-    last_customer_message: Optional[str] = None
     most_recent_customer_inquiry_or_need: Optional[str] = None
     most_recent_customer_inquiry_or_need_was_already_resolved: Optional[bool] = None
-    name: str
     subtleties_to_be_aware_of: str
     tool_calls_for_candidate_tool: list[SingleToolBatchToolCallEvaluation]
 
@@ -719,10 +716,8 @@ OUTPUT FORMAT
 Given the tool, your output should adhere to the following format:
 ```json
 {{
-    "last_customer_message": "<REPEAT THE LAST USER MESSAGE IN THE INTERACTION>",
     "most_recent_customer_inquiry_or_need": "<CUSTOMER'S INQUIRY OR NEED>",
     "most_recent_customer_inquiry_or_need_was_already_resolved": <BOOL>,
-    "name": "{service_name}:{tool_name}",
     "subtleties_to_be_aware_of": "<NOTE ANY SIGNIFICANT SUBTLETIES TO BE AWARE OF WHEN RUNNING THIS TOOL IN OUR AGENT'S CONTEXT>",
     "tool_calls_for_candidate_tool": [{tool_calls_for_candidate_tool_json_description}
     ]
@@ -732,8 +727,6 @@ Given the tool, your output should adhere to the following format:
 However, note that you may choose to have multiple entries in 'tool_calls_for_candidate_tool' if you wish to call the candidate tool multiple times with different arguments.
 """,
             props={
-                "service_name": batch[0].service_name,
-                "tool_name": batch[0].tool_name,
                 "candidate_tool": batch[1],
                 "has_reference_tools": bool(reference_tools),
                 "tool_calls_for_candidate_tool_json_description": self._format_tool_calls_for_candidate_tool_json_description(
@@ -758,7 +751,6 @@ However, note that you may choose to have multiple entries in 'tool_calls_for_ca
             "argument_evaluations": [
                 {
                     "parameter_name": "<PARAMETER NAME>",
-                    "acceptable_source_for_this_argument_according_to_its_tool_definition": "<REPEAT THE ACCEPTABLE SOURCE FOR THE ARGUMENT FROM TOOL DEFINITION>",
                     "evaluate_is_it_provided_by_an_acceptable_source": "<BRIEFLY EVALUATE IF THE SOURCE FOR THE VALUE MATCHES THE ACCEPTABLE SOURCE>",
                     "evaluate_was_it_already_provided_and_should_it_be_provided_again": "<BRIEFLY EVALUATE IF THE PARAMETER VALUE WAS PROVIDED AND SHOULD BE PROVIDED AGAIN>",
                     "evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided": "<BRIEFLY EVALUATE IF IT'S A PROBLEM TO GUESS THE VALUE>","""
@@ -1358,13 +1350,11 @@ example_1_shot = SingleToolBatchShot(
     description="the id of the customer is 12345, and check_balance(12345) is already listed as a staged tool call",
     feature_set=[],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="Do I have enough money in my account to get a taxi from New York to Newark?",
         most_recent_customer_inquiry_or_need=(
             "Checking customer's balance, comparing it to the price of a taxi from New York to Newark, "
             "and report the result to the customer"
         ),
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="check_balance",
         subtleties_to_be_aware_of="check_balance(12345) is already staged",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1373,7 +1363,6 @@ example_1_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="customer_id",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="The customer ID is given by a context variable",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="No need to provide it again as the customer's ID is unique and doesn't change",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be extremely problematic, but I don't need to guess here since I have it",
@@ -1396,13 +1385,11 @@ example_2_shot = SingleToolBatchShot(
     description="the id of the customer is 12345, and check_balance(12345) is listed as the only staged tool call",
     feature_set=[],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="Do I have enough money in my account to get a taxi from New York to Newark?",
         most_recent_customer_inquiry_or_need=(
             "Checking customer's balance, comparing it to the price of a taxi from New York to Newark, "
             "and report the result to the customer"
         ),
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="ping_supervisor",
         subtleties_to_be_aware_of="no subtleties were detected",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1425,13 +1412,11 @@ example_3_shot = SingleToolBatchShot(
     ),
     feature_set=["has_reference_tools"],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="Do I have enough money in my account to get a taxi from New York to Newark?",
         most_recent_customer_inquiry_or_need=(
             "Checking customer's balance, comparing it to the price of a taxi from New York to Newark, "
             "and report the result to the customer"
         ),
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="check_ride_price",
         subtleties_to_be_aware_of="no subtleties were detected",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1440,7 +1425,6 @@ example_3_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="origin",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="Yes, the customer mentioned New York as the origin for their ride",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer already specifically provided it",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be extremely problematic, but I don't need to guess here since the customer provided it",
@@ -1450,7 +1434,6 @@ example_3_shot = SingleToolBatchShot(
                     ),
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="destination",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="Yes, the customer mentioned Newark as the destination for their ride",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer already specifically provided it",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be extremely problematic, but I don't need to guess here since the customer provided it",
@@ -1480,12 +1463,10 @@ example_4_shot = SingleToolBatchShot(
     ),
     feature_set=["has_reference_tools"],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="Which pizza has more calories, the classic margherita or the deep dish?",
         most_recent_customer_inquiry_or_need=(
             "Checking the number of calories in two types of pizza and replying with which one has more"
         ),
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="check_calories",
         subtleties_to_be_aware_of="two products need to be checked for calories - margherita and deep dish",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1494,7 +1475,6 @@ example_4_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="product_name",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="The first product the customer specified is a margherita",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer already specifically provided it",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random product, but I don't need to guess here since the customer provided it",
@@ -1519,7 +1499,6 @@ example_4_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="product_name",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="The second product the customer specified is the deep dish",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer already specifically provided it",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random product, but I don't need to guess here since the customer provided it",
@@ -1548,10 +1527,8 @@ example_5_shot = SingleToolBatchShot(
     ),
     feature_set=["has_reference_tools"],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="What's your price for a Harley-Davidson Street Glide?",
         most_recent_customer_inquiry_or_need="Checking the price of a Harley-Davidson Street Glide motorcycle",
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="check_motorcycle_price",
         subtleties_to_be_aware_of="Both the candidate and reference tool could apply - we need to choose the one that applies best",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1560,7 +1537,6 @@ example_5_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="model",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer asked about a specific model",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer asked about a specific model",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random model, but I don't need to guess here since the customer provided it",
@@ -1596,10 +1572,8 @@ example_6_shot = SingleToolBatchShot(
     ),
     feature_set=["has_reference_tools"],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="What's your price for a Harley-Davidson Street Glide?",
         most_recent_customer_inquiry_or_need="Checking the price of a Harley-Davidson Street Glide motorcycle",
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="check_vehicle_price",
         subtleties_to_be_aware_of="no subtleties were detected",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1608,7 +1582,6 @@ example_6_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="model",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer asked about a specific model",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer asked about a specific model",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random model, but I don't need to guess here since the customer provided it",
@@ -1641,10 +1614,8 @@ example_7_shot = SingleToolBatchShot(
     ),
     feature_set=["has_reference_tools"],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="What's the temperature in the living room right now?",
         most_recent_customer_inquiry_or_need="Checking the current temperature in the living room",
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="check_temperature",
         subtleties_to_be_aware_of="no subtleties were detected",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1653,7 +1624,6 @@ example_7_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="location",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer asked about the living room",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer asked about a specific location",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random room, but I don't need to guess here since the customer provided it",
@@ -1688,10 +1658,8 @@ example_8_shot = SingleToolBatchShot(
     ),
     feature_set=["has_reference_tools"],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="I'm looking for a gaming laptop with at least 16GB RAM and an RTX 3080",
         most_recent_customer_inquiry_or_need="Searching for a gaming laptop with specific technical requirements",
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="search_product",
         subtleties_to_be_aware_of="A gaming laptop is strictly speaking a product, but more specifically it's an electronic product",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1700,7 +1668,6 @@ example_8_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="query",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer mentioned their specific requirements",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer mentioned specific requirements, which is enough for me to construct a query",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random product, but I don't need to guess here since the customer provided their requirements",
@@ -1733,10 +1700,8 @@ example_9_shot = SingleToolBatchShot(
     description=("the candidate tool is schedule_appointment(date: str)"),
     feature_set=[],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="I want to schedule an appointment please",
         most_recent_customer_inquiry_or_need="The customer wishes to schedule an appointment",
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="schedule_appointment",
         subtleties_to_be_aware_of="The candidate tool has a date argument",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1745,7 +1710,6 @@ example_9_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="date",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="No; the customer hasn't provided a date, and I cannot guess it or infer when they'd be available",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer hasn't specified it yet",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It is very problematic to just guess when the customer would be available for an appointment",
@@ -1768,12 +1732,10 @@ example_10_shot = SingleToolBatchShot(
     description="the candidate tool is check_products_availability(products: list[str])",
     feature_set=[],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="Hey can I buy a laptop and a mouse please?",
         most_recent_customer_inquiry_or_need=(
             "The customer wants to purchase a laptop and a mouse and we need to check if those products are available"
         ),
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="check_products_availability",
         subtleties_to_be_aware_of="Before the customer can make a purchase, we need to check the availability of laptops and mice. The 'products' parameter is a list, so the tool should be called once with both products in the list.",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1782,7 +1744,6 @@ example_10_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="products",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="Yes, the product names 'laptop' and 'mouse' were provided in the customer's message so should be passed as list.",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="It was provided in customer's message and should not be provided again.",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="Yes, guessing product names can result in incorrect availability checks.",
@@ -1807,10 +1768,8 @@ example_11_shot = SingleToolBatchShot(
     description="the candidate tool is book_flight(passenger_name: str, origin: str, destination: str, departure_date: str, return_date:str)",
     feature_set=[],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="Hey can I book a flight to Bangkok?",
         most_recent_customer_inquiry_or_need=("The customer wants to book a flight to Bangkok"),
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="book_flight",
         subtleties_to_be_aware_of="The customer clearly wants to book a flight but has not provided many of the required details for booking like origin anf departure date.",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1819,7 +1778,6 @@ example_11_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="passenger_name",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="No, the customer has not provided a name and there is no prior context.",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="It has not been provided.",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="Yes, using an incorrect or placeholder name could result in booking errors.",
@@ -1829,7 +1787,6 @@ example_11_shot = SingleToolBatchShot(
                     ),
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="origin",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="No, the customer did not mention the departure location.",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="It has not been provided.",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="Yes, guessing the origin can result in incorrect flight details.",
@@ -1839,7 +1796,6 @@ example_11_shot = SingleToolBatchShot(
                     ),
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="destination",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="Yes, the customer specifically mentioned Bangkok.",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="Yes, it was included in the customer's message and should not be asked again.",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="Yes, guessing the destination could lead to incorrect booking",
@@ -1849,7 +1805,6 @@ example_11_shot = SingleToolBatchShot(
                     ),
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="departure_date",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="No, the customer did not mention a departure date.",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="It has not been provided.",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="Yes, guessing a date could lead to incorrect or undesired bookings.",
@@ -1859,7 +1814,6 @@ example_11_shot = SingleToolBatchShot(
                     ),
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="return_date",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="No, the customer did not mention a return date.",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="It has not been provided.",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="Yes, assuming a return date can misrepresent the customer's intent",
@@ -1885,10 +1839,8 @@ example_12_shot = SingleToolBatchShot(
     ),
     feature_set=[],
     expected_result=SingleToolBatchSchema(
-        last_customer_message="I want to book a flight from Tel-Aviv to Singapore",
         most_recent_customer_inquiry_or_need="The customer want to book a flight",
         most_recent_customer_inquiry_or_need_was_already_resolved=False,
-        name="book_flight",
         subtleties_to_be_aware_of="The customer specified a flight origin and destination that may be invalid in the schema's enum, but their values are still important and should be filled in the output",
         tool_calls_for_candidate_tool=[
             SingleToolBatchToolCallEvaluation(
@@ -1897,7 +1849,6 @@ example_12_shot = SingleToolBatchShot(
                 argument_evaluations=[
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="origin",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer has explicitly provided an origin, which is an acceptable source but not in the enum, so regardless of validity considerations its value is extracted into the relevant field",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="Yes, the customer has explicitly provided an origin, so it should be extracted and filled into the matching output field even if not a valid enum value",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It is very problematic to guess the origin the customer wants to fly from",
@@ -1907,7 +1858,6 @@ example_12_shot = SingleToolBatchShot(
                     ),
                     SingleToolBatchArgumentEvaluation(
                         parameter_name="destination",
-                        acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                         evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer has explicitly provided a destination, which is an acceptable source but not in the enum, so regardless of validity considerations its value is extracted into the relevant field",
                         evaluate_was_it_already_provided_and_should_it_be_provided_again="Yes, the customer has explicitly provided a destination, so it should be extracted and filled into the matching output field even if not a valid enum value",
                         evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It is very problematic to guess the destination the customer wants to fly to",

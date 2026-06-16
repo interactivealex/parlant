@@ -58,8 +58,6 @@ class SegmentPreviouslyAppliedActionableRationale(DefaultBaseModel):
 
 class GuidelinePreviouslyAppliedActionableDetectionSchema(DefaultBaseModel):
     guideline_id: str
-    condition: Optional[str] = None
-    action: str
     guideline_applied_rationale: Optional[list[SegmentPreviouslyAppliedActionableRationale]] = None
     guideline_applied_degree: Optional[str] = None
     is_missing_part_functional_or_behavioral_rationale: Optional[str] = None
@@ -397,7 +395,6 @@ OUTPUT FORMAT
             props={
                 "result_structure_text": self._format_of_guideline_check_json_description(
                     guidelines=guidelines,
-                    guideline_representations=guideline_representations,
                 ),
                 "guidelines_len": len(guidelines),
             },
@@ -407,17 +404,14 @@ OUTPUT FORMAT
     def _format_of_guideline_check_json_description(
         self,
         guidelines: dict[str, Guideline],
-        guideline_representations: dict[GuidelineId, GuidelineInternalRepresentation],
     ) -> str:
         result_structure = [
             {
                 "guideline_id": i,
-                # "condition": g.content.condition,
-                "action": guideline_representations[g.id].action,
                 "guideline_applied_rationale": [
                     {
-                        "action_segment": "<action_segment_description>",
-                        "action_applied_rationale": "<explanation of whether this action segment (apart from condition) was applied by the agent; to avoid pitfalls, try to use the exact same words here as the action segment to determine this. use CAPITALS to highlight the same words in the segment as in your explanation>",
+                        "action_segment": "<a brief, few-word label of this part of the action — do NOT copy the full action text>",
+                        "action_applied_rationale": "<a short explanation of whether the agent applied this segment (apart from the condition). Keep it brief; do not restate the action verbatim — the full action already appears above>",
                     }
                 ],
                 "guideline_applied_degree": "<str: either 'no', 'partially' or 'fully' depending on whether and to what degree the action was preformed (apart from condition)>",
@@ -470,12 +464,10 @@ example_1_expected = GenericResponseAnalysisSchema(
     checks=[
         GuidelinePreviouslyAppliedActionableDetectionSchema(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            # condition="the customer initiates a purchase.",
-            action="Open a new cart for the customer",
             guideline_applied_rationale=[
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="OPEN a new cart for the customer",
-                    action_applied_rationale="No cart was opened",
+                    action_segment="open cart",
+                    action_applied_rationale="cart was not opened",
                 )
             ],
             guideline_applied_degree="no",
@@ -483,12 +475,10 @@ example_1_expected = GenericResponseAnalysisSchema(
         ),
         GuidelinePreviouslyAppliedActionableDetectionSchema(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            # condition="the customer asks about data security",
-            action="Refer the customer to our privacy policy page",
             guideline_applied_rationale=[
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="REFER the customer to our privacy policy page",
-                    action_applied_rationale="The customer has been REFERRED to the privacy policy page.",
+                    action_segment="refer to privacy policy",
+                    action_applied_rationale="referred to the privacy policy page",
                 )
             ],
             guideline_applied_degree="fully",
@@ -527,16 +517,14 @@ example_2_expected = GenericResponseAnalysisSchema(
     checks=[
         GuidelinePreviouslyAppliedActionableDetectionSchema(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            # condition="the customer indicates that they are looking for a job.",
-            action="ask the customer for their location and what kind of role they are looking for",
             guideline_applied_rationale=[
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="ASK the customer for their location",
-                    action_applied_rationale="The agent ASKED for the customer's location earlier in the interaction.",
+                    action_segment="ask for location",
+                    action_applied_rationale="agent asked for the location earlier",
                 ),
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="ASK the customer what kind of role they are looking for",
-                    action_applied_rationale="The agent ASKED what kind of role they customer is interested in.",
+                    action_segment="ask for desired role",
+                    action_applied_rationale="agent asked what role they want",
                 ),
             ],
             guideline_applied_degree="fully",
@@ -544,16 +532,14 @@ example_2_expected = GenericResponseAnalysisSchema(
         ),
         GuidelinePreviouslyAppliedActionableDetectionSchema(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            # condition="the customer asks about job openings.",
-            action="emphasize that we have plenty of positions relevant to the customer, and over 10,000 openings overall",
             guideline_applied_rationale=[
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="EMPHASIZE we have plenty of relevant positions",
-                    action_applied_rationale="The agent already has EMPHASIZED (i.e. clearly stressed) that we have open positions",
+                    action_segment="emphasize many relevant positions",
+                    action_applied_rationale="agent stressed we have open positions",
                 ),
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="EMPHASIZE we have over 10,000 openings overall",
-                    action_applied_rationale="The agent neglected to EMPHASIZE (i.e. clearly stressed) that we offer 10k openings overall.",
+                    action_segment="emphasize 10,000+ openings",
+                    action_applied_rationale="agent did not mention the 10k overall figure",
                 ),
             ],
             guideline_applied_degree="partially",
@@ -585,16 +571,14 @@ example_3_expected = GenericResponseAnalysisSchema(
     checks=[
         GuidelinePreviouslyAppliedActionableDetectionSchema(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            # condition="the customer indicates that they are looking for a job.",
-            action="ask the customer for their location and what kind of role they are looking for",
             guideline_applied_rationale=[
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="ASK the customer for their location",
-                    action_applied_rationale="The agent ASKED for the customer's location earlier in the interaction.",
+                    action_segment="ask for location",
+                    action_applied_rationale="agent asked for the location earlier",
                 ),
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="ASK the customer what kind of role they are looking for",
-                    action_applied_rationale="The agent did not ASK what kind of role the customer is interested in.",
+                    action_segment="ask for desired role",
+                    action_applied_rationale="agent did not ask what role they want",
                 ),
             ],
             guideline_applied_degree="partially",
@@ -626,12 +610,10 @@ example_4_expected = GenericResponseAnalysisSchema(
     checks=[
         GuidelinePreviouslyAppliedActionableDetectionSchema(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            # condition="the customer says they forgot their password",
-            action="Offer to reset the password.",
             guideline_applied_rationale=[
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="OFFER to reset the password",
-                    action_applied_rationale="The agent indeed OFFERED to reset the password.",
+                    action_segment="offer password reset",
+                    action_applied_rationale="agent offered to reset the password",
                 ),
             ],
             guideline_applied_degree="fully",
@@ -665,16 +647,14 @@ example_5_expected = GenericResponseAnalysisSchema(
     checks=[
         GuidelinePreviouslyAppliedActionableDetectionSchema(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            # condition="there is a problem with the order",
-            action="Acknowledge the issue and thank the user for their patience.",
             guideline_applied_rationale=[
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="ACKNOWLEDGE the issue",
-                    action_applied_rationale="The agent ACKNOWLEDGED the issue by saying they are checking it",
+                    action_segment="acknowledge the issue",
+                    action_applied_rationale="agent acknowledged by saying they are checking",
                 ),
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="THANK the user for their patience.",
-                    action_applied_rationale="The agent didn't thank the customer for their patient",
+                    action_segment="thank for patience",
+                    action_applied_rationale="agent did not thank the customer",
                 ),
             ],
             guideline_applied_degree="partially",
@@ -711,12 +691,10 @@ example_6_expected = GenericResponseAnalysisSchema(
     checks=[
         GuidelinePreviouslyAppliedActionableDetectionSchema(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            # condition="The customer reports that a product arrived damaged",
-            action="Offer a $20 refund on the purchase.",
             guideline_applied_rationale=[
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="OFFER a $20 refund on the purchase.",
-                    action_applied_rationale="The agent OFFERED $20 refund for the delay, although not for damaged item.",
+                    action_segment="offer $20 refund",
+                    action_applied_rationale="agent offered a $20 refund, for the delay not the damage",
                 ),
             ],
             guideline_applied_degree="fully",
@@ -749,16 +727,14 @@ example_7_expected = GenericResponseAnalysisSchema(
     checks=[
         GuidelinePreviouslyAppliedActionableDetectionSchema(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            # condition="The customer said they don't need any other help",
-            action="Wish the customer a great day at the end of the interaction.",
             guideline_applied_rationale=[
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="Wish the customer a great day",
-                    action_applied_rationale="The agent didn't WISH a great day",
+                    action_segment="wish a great day",
+                    action_applied_rationale="agent did not wish a great day",
                 ),
                 SegmentPreviouslyAppliedActionableRationale(
-                    action_segment="END of the interaction.",
-                    action_applied_rationale="The agent END the interaction by saying goodbye.",
+                    action_segment="end interaction",
+                    action_applied_rationale="agent ended by saying goodbye",
                 ),
             ],
             guideline_applied_degree="partially",

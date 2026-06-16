@@ -51,8 +51,6 @@ from parlant.core.shots import Shot, ShotCollection
 
 class GenericPreviouslyAppliedActionableBatch(DefaultBaseModel):
     guideline_id: str
-    condition: str
-    action: str
     condition_met_again: bool
     action_wasnt_taken: Optional[bool] = None
     should_reapply: bool
@@ -337,8 +335,6 @@ OUTPUT FORMAT
         result_structure = [
             {
                 "guideline_id": i,
-                "condition": guideline_representations[g.id].condition,
-                "action": guideline_representations[g.id].action,
                 "condition_met_again": "<BOOL. Whether the condition met again in a new or subtly different context or information>",
                 "action_wasnt_taken": "<BOOL. include only condition_met_again is True if The action wasn't already taken for this new reason>",
                 "should_reapply": "<BOOL>",
@@ -501,15 +497,11 @@ example_1_expected = GenericPreviouslyAppliedActionableGuidelineMatchesSchema(
     checks=[
         GenericPreviouslyAppliedActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="the customer initiates a purchase.",
-            action="Open a new cart for the customer",
             condition_met_again=False,
             should_reapply=False,
         ),
         GenericPreviouslyAppliedActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="the customer asks about data security",
-            action="Refer the customer to our privacy policy page",
             condition_met_again=True,
             action_wasnt_taken=True,
             should_reapply=True,
@@ -548,16 +540,12 @@ example_2_expected = GenericPreviouslyAppliedActionableGuidelineMatchesSchema(
     checks=[
         GenericPreviouslyAppliedActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="the customer asks about the value of a stock.",
-            action="provide the price using the 'check_stock_price' tool",
             condition_met_again=True,
             action_wasnt_taken=True,
             should_reapply=True,
         ),
         GenericPreviouslyAppliedActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="the weather at a certain location is discussed.",
-            action="check the weather at that location using the 'check_weather' tool",
             condition_met_again=False,
             should_reapply=False,
         ),
@@ -609,8 +597,6 @@ example_3_expected = GenericPreviouslyAppliedActionableGuidelineMatchesSchema(
     checks=[
         GenericPreviouslyAppliedActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The customer asks about their account balance, billing amount, or payment status.",
-            action="Provide the current account balance or billing information clearly.",
             condition_met_again=False,
             should_reapply=False,
         ),
@@ -649,16 +635,12 @@ example_4_expected = GenericPreviouslyAppliedActionableGuidelineMatchesSchema(
     checks=[
         GenericPreviouslyAppliedActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="the customer asks about the value of a stock.",
-            action="provide the price using the 'check_stock_price' tool",
             condition_met_again=True,
             action_wasnt_taken=False,
             should_reapply=False,
         ),
         GenericPreviouslyAppliedActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="the weather at a certain location is discussed.",
-            action="check the weather at that location using the 'check_weather' tool",
             condition_met_again=False,
             should_reapply=False,
         ),

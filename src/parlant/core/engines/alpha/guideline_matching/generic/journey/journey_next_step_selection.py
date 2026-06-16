@@ -41,9 +41,7 @@ class JourneyNodeKind(Enum):
 
 
 class JourneyNextStepSelectionSchema(DefaultBaseModel):
-    journey_continues: bool
     current_step_completed_rationale: str
-    current_step_completed: bool
     next_step_rationale: str
     applied_condition_id: str
 
@@ -451,9 +449,7 @@ OUTPUT FORMAT
 
 ```json
 {
-"journey_continues": <bool, whether the journey should continued. Reminder: If you are already executing journey steps (i.e., there is a "last_step"), the journey almost always continues. The activation condition is ONLY for starting new journeys, NOT for validating ongoing ones.>,
 "current_step_completed_rationale": "<str, short explanation of whether current step completed>",
-"current_step_completed": <bool, whether the current step completed.>,
 "next_step_rationale": "<str, explanation for which condition best fits and why. Consider all the information provided in CURRENT and EARLIER messages>",
 "applied_condition_id": "<str, id of the applied condition, '0' if current step hasn't completed or 'None' if the journey should not continue>"
 }
@@ -568,12 +564,11 @@ If the journey should end, set `applied_condition_id` to `"None"`.
 ## 2: Current Step Completion
 Evaluate whether the last executed step is complete:
     - For CUSTOMER_DEPENDENT steps: The step is completed if customer has provided the required information. It can be either after being asked or proactively in earlier messages.
-    If the customer provided the information, set current_step_completed to 'true'.
-    If not, set completed to 'current_step_completed' as 'false' and applied_condition_id as '0'.
+    If the customer provided the information, the step is complete.
+    If not, set applied_condition_id as '0'.
 
     - For REQUIRES AGENT ACTION steps: The step is completed if the agent has performed the required communication or action.
-    If so, set current_step_completed to 'true'.
-    If not, set 'current_step_completed' as 'false' and applied_condition_id as '0'.
+    If not, set applied_condition_id as '0'.
 
     - For TOOL EXECUTION steps: The tool was executed, and its result will appear as a staged event. Evaluate which condition applies for the next transition based on the tool result..
         Note that the tool execution is the final action in the interaction, meaning all message exchanges occurred beforehand. Make sure to consider this order in your evaluation.
@@ -726,9 +721,7 @@ example_1_follow_up_nodes = {
 
 
 example_1_expected = JourneyNextStepSelectionSchema(
-    journey_continues=True,
     current_step_completed_rationale="The customer has NOT provided the pickup location, which is what the current step asks for. The current step is therefore incomplete",
-    current_step_completed=False,
     next_step_rationale="Current step hasn't completed so applied condition is '0",
     applied_condition_id="0",
 )
@@ -783,9 +776,7 @@ example_2_follow_up_nodes = {
     ),
 }
 example_2_expected = JourneyNextStepSelectionSchema(
-    journey_continues=True,
     current_step_completed_rationale="The agent welcomed the customer, so current step completed.",
-    current_step_completed=True,
     next_step_rationale="The customer provided a pick up location in NYC and a pick up time, but has not provided a destination, so condition 2 best holds.",
     applied_condition_id="2",
 )
@@ -876,9 +867,7 @@ example_3_follow_up_nodes = {
 
 
 example_3_expected = JourneyNextStepSelectionSchema(
-    journey_continues=True,
     current_step_completed_rationale="The customer wants a loan for their restaurant, making it a business loan. So current step completed",
-    current_step_completed=True,
     next_step_rationale="The customer has already specified in previous messages the amount of the loan and stocks as collateral which are digital. "
     "The agent hasn't reviewed and confirmed the application so condition 6 is most appropriate",
     applied_condition_id="6",
@@ -926,9 +915,7 @@ example_4_follow_up_nodes = {
 }
 
 example_4_expected = JourneyNextStepSelectionSchema(
-    journey_continues=True,
     current_step_completed_rationale="The agent welcomed the customer, so current step completed.",
-    current_step_completed=True,
     next_step_rationale="The customer provided pickup location (NYC), destination (Plaza Hotel), time (6 AM), and payment method (cash). All conditions have some unsatisfied parts but condition 4 has the most satisfied sub-conditions",
     applied_condition_id="4",
 )
@@ -991,9 +978,7 @@ example_5_follow_up_nodes = {
 
 
 example_5_expected = JourneyNextStepSelectionSchema(
-    journey_continues=True,
     current_step_completed_rationale="The customer said the loan is for them because they unemployed, so it's personal loan.",
-    current_step_completed=True,
     next_step_rationale="The customer has already mentioned in initial message that they need 50,000, so they provided the amount in earlier messages and it considered complete."
     " Also, they provided the employment status by saying they unemployed. The agent has not confirmed the application so condition 5 fits.",
     applied_condition_id="5",

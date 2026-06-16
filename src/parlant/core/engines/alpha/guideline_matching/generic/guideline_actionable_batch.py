@@ -51,7 +51,6 @@ from parlant.core.shots import Shot, ShotCollection
 
 class GenericActionableBatch(DefaultBaseModel):
     guideline_id: str
-    condition: str
     rationale: str
     applies: bool
 
@@ -317,7 +316,6 @@ OUTPUT FORMAT
         result_structure = [
             {
                 "guideline_id": i,
-                "condition": guideline_representations[g.id].condition,
                 "rationale": "<Explanation for why the condition is or isn't met when focusing on the most recent interaction>",
                 "applies": "<BOOL>",
             }
@@ -475,19 +473,16 @@ example_1_expected = GenericActionableGuidelineMatchesSchema(
     checks=[
         GenericActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The customer is looking for flight or accommodation booking assistance",
             rationale="There’s no mention of booking logistics like flights or hotels",
             applies=False,
         ),
         GenericActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The customer asks for activities recommendations",
             rationale="The customer has moved from seeking activity recommendations to asking about legal requirements. Since they are no longer pursuing their original inquiry about activities, this represents a new topic rather than a sub-issue",
             applies=False,
         ),
         GenericActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The customer asks for logistical or legal requirements.",
             rationale="The customer now asked about visas and documents which are legal requirements",
             applies=True,
         ),
@@ -542,19 +537,16 @@ example_2_expected = GenericActionableGuidelineMatchesSchema(
     checks=[
         GenericActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The customer mentions a constraint that is related to commitment to the course",
             rationale="In the most recent message, the customer mentions that they work full time which is a constraint",
             applies=True,
         ),
         GenericActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The user expresses hesitation or self-doubt.",
             rationale="In the most recent message the user still sounds hesitant about their fit to the course",
             applies=True,
         ),
         GenericActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="The user asks about certification or course completion benefits.",
             rationale="The user didn't ask about certification or course completion benefits",
             applies=False,
         ),
@@ -601,7 +593,6 @@ example_3_expected = GenericActionableGuidelineMatchesSchema(
     checks=[
         GenericActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="When the user is having a problem with login.",
             rationale="In the most recent message the customer is still pursuing their login problem, making the mail access problem a sub-issue rather than a new topic",
             applies=True,
         ),
@@ -634,7 +625,6 @@ example_4_expected = GenericActionableGuidelineMatchesSchema(
     checks=[
         GenericActionableBatch(
             guideline_id=GuidelineId("<example-id-for-few-shots--do-not-use-this-in-output>"),
-            condition="When the customer asks about how to return an item.",
             rationale="In the most recent message the customer asks about what happens when they wore the item, which is an inquiry regarding returning an item",
             applies=True,
         ),
