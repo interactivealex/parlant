@@ -34,7 +34,6 @@ class AgentIntentionProposition(DefaultBaseModel):
 
 
 class AgentIntentionProposerSchema(DefaultBaseModel):
-    condition: str
     is_agent_intention: bool
     rewritten_condition: Optional[str] = ""
 
@@ -175,13 +174,12 @@ Use the following format to evaluate whether the guideline has a customer depend
 Expected output (JSON):
 ```json
 {{
-  "condition": "{condition}",
   "is_agent_intention": "<BOOL>",
   "rewritten_condition": "<STR, include it is_agent_intention is True. Rewrite the condition in the format of "You are likely to (do something)" >",
 }}
 ```
 """,
-            props={"condition": escape_json_string(guideline.condition)},
+            props={},
         )
 
         return builder
@@ -227,7 +225,6 @@ example_1_shot = AgentIntentionProposerShot(
     description="Condition tries to predict the agent's own intention in the next turn",
     guideline=example_1_guideline,
     expected_result=AgentIntentionProposerSchema(
-        condition=example_1_guideline.condition,
         is_agent_intention=True,
         rewritten_condition="You are likely to discuss a patient's medical record",
     ),
@@ -241,7 +238,6 @@ example_2_shot = AgentIntentionProposerShot(
     description="Condition tries to predict the agent's own intention in the next turn",
     guideline=example_2_guideline,
     expected_result=AgentIntentionProposerSchema(
-        condition=example_2_guideline.condition,
         is_agent_intention=True,
         rewritten_condition="You are likely to interpret a contract or legal term",
     ),
@@ -255,7 +251,6 @@ example_3_shot = AgentIntentionProposerShot(
     description="Condition describes something that has already happened, which can be inferred from the conversation history, rather than something that is likely to happen in the next turn",
     guideline=example_3_guideline,
     expected_result=AgentIntentionProposerSchema(
-        condition=example_3_guideline.condition,
         is_agent_intention=False,
     ),
 )
@@ -268,7 +263,6 @@ example_4_shot = AgentIntentionProposerShot(
     description="Condition tries to predict the agent's own intention in the next turn, and is already phrased in a way that reflects that, so it doesn't need to be rewritten",
     guideline=example_4_guideline,
     expected_result=AgentIntentionProposerSchema(
-        condition=example_4_guideline.condition,
         is_agent_intention=True,
         rewritten_condition="You are likely to interpret a contract or legal term",
     ),
@@ -282,7 +276,6 @@ example_5_shot = AgentIntentionProposerShot(
     description="Condition describes something that the customer is doing, which can be inferred from the conversation history, rather than something that the agent itself is likely to do in the next turn",
     guideline=example_5_guideline,
     expected_result=AgentIntentionProposerSchema(
-        condition=example_5_guideline.condition,
         is_agent_intention=False,
     ),
 )
@@ -295,7 +288,6 @@ example_6_shot = AgentIntentionProposerShot(
     description="Condition describes something that the customer is doing, which cannot be directly inferred from the conversation history, but is also not something that the agent itself is likely to do in the next turn. The condition should not be considered an agent intention.",
     guideline=example_6_guideline,
     expected_result=AgentIntentionProposerSchema(
-        condition=example_6_guideline.condition,
         is_agent_intention=False,
     ),
 )

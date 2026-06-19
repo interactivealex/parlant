@@ -19,7 +19,6 @@ class ToolRunningActionProposition(DefaultBaseModel):
 
 
 class ToolRunningActionSchema(DefaultBaseModel):
-    action: str
     rationale: str
     is_tool_running_only: bool
 
@@ -228,13 +227,12 @@ Use the following format to evaluate whether the guideline has a customer depend
 Expected output (JSON):
 ```json
 {{
-  "action": "{action}",
   "rationale": "<str, a few words that explains whether it tool running only>"
   "is_tool_running_only": "<BOOL>",
 }}
 ```
 """,
-            props={"action": guideline.action},
+            props={},
         )
 
         return builder
@@ -289,7 +287,6 @@ example_1_shot = ToolRunningActionShot(
     description="tool available:  reset_password(acount_number: int)",
     guideline=example_1_guideline,
     expected_result=ToolRunningActionSchema(
-        action=example_1_guideline.action,
         rationale="Need to confirm with the customer that the reset was sent by mail",
         is_tool_running_only=False,
     ),
@@ -303,7 +300,6 @@ example_2_shot = ToolRunningActionShot(
     description="tool available: reset_password(acount_number: int) and send_email_confirmation(email_address: str)",
     guideline=example_2_guideline,
     expected_result=ToolRunningActionSchema(
-        action=example_2_guideline.action,
         rationale="need to reset with a tool and confirm also with a tool",
         is_tool_running_only=True,
     ),

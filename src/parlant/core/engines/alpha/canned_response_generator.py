@@ -301,7 +301,6 @@ class AdditionalFieldExtraction(CannedResponseFieldExtractionMethod):
 
 
 class CannedResponseFieldExtractionSchema(DefaultBaseModel):
-    field_name: Optional[str] = None
     field_value: Optional[str] = None
 
 
@@ -424,27 +423,27 @@ A few examples:
 ---------------
 1) Canned response is "Hello {{{{generative.name}}}}, how may I help you today?"
 Example return value: ###
-{{ "field_name": "name", "field_value": "John" }}
+{{ "field_value": "John" }}
 ###
 
 2) Canned response is "Hello {{{{generative.names}}}}, how may I help you today?"
 Example return value: ###
-{{ "field_name": "names", "field_value": "John and Katie" }}
+{{ "field_value": "John and Katie" }}
 ###
 
 3) Canned response is "Next flights are {{{{generative.flight_list}}}}
 Example return value: ###
-{{ "field_name": "flight_list", "field_value": "- <FLIGHT_1>\\n- <FLIGHT_2>\\n" }}
+{{ "field_value": "- <FLIGHT_1>\\n- <FLIGHT_2>\\n" }}
 ###
 
 4) Canned response is "It seems that {{{{generative.customer_issue}}}} might be caused by a different issue."
 Example return value: ###
-{{ "field_name": "customer_issue", "field_value": "the red light you're seeing" }}
+{{ "field_value": "the red light you're seeing" }}
 ###
 
 5) Canned response is "I could suggest {{{{generative.way_to_help}}}} as a potential solution."
 Example return value: ###
-{{ "field_name": "way_to_help", "field_value": "that you restart your router" }}
+{{ "field_value": "that you restart your router" }}
 ###
 """,
             props={"canned_response": canned_response, "field_name": field_name},

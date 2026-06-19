@@ -35,7 +35,6 @@ class CustomerDependentActionProposition(DefaultBaseModel):
 
 
 class CustomerDependentActionSchema(DefaultBaseModel):
-    action: str
     is_customer_dependent: bool
     customer_action: Optional[str] = ""
     agent_action: Optional[str] = ""
@@ -179,14 +178,13 @@ Use the following format to evaluate whether the guideline has a customer depend
 Expected output (JSON):
 ```json
 {{
-  "action": "{action}",
   "is_customer_dependent": "<BOOL>",
   "customer_action": "<STR, the portion of the action that applies to the customer. Can be omitted if is_customer_dependent is false>",
   "agent_action": "<STR, the portion of the action that applies to the agent. Can be omitted necessary if is_customer_dependent is false>"
 }}
 ```
 """,
-            props={"action": escape_json_string(guideline.action) if guideline.action else None},
+            props={},
         )
 
         return builder
@@ -230,7 +228,6 @@ example_1_shot = CustomerDependentActionShot(
     description="A guideline with a customer dependent action",
     guideline=example_1_guideline,
     expected_result=CustomerDependentActionSchema(
-        action=example_1_guideline.action or "",
         is_customer_dependent=True,
         customer_action="The customer provided both their account number and shipping address",
         agent_action="The agent asks for the customer's account number and shipping address, and informs them that it would take 3-5 business days.",
@@ -243,9 +240,7 @@ example_2_guideline = GuidelineContent(
 example_2_shot = CustomerDependentActionShot(
     description="A guideline whose action involves a question, but is not customer dependent",
     guideline=example_2_guideline,
-    expected_result=CustomerDependentActionSchema(
-        action=example_2_guideline.action or "", is_customer_dependent=False
-    ),
+    expected_result=CustomerDependentActionSchema(is_customer_dependent=False),
 )
 
 _baseline_shots: Sequence[CustomerDependentActionShot] = [
