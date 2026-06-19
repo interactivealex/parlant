@@ -102,6 +102,10 @@ class JourneyReachableNodesEvaluationShot(Shot):
 
 
 class JourneyReachableNodesEvaluator:
+    # Reask attempts per generator before escalating to the next one (base, then
+    # fallback). Kept in step with BaseSchematicGenerator.schema_validation_retries.
+    _SEMANTIC_RETRY_ATTEMPTS = 3
+
     def __init__(
         self,
         logger: Logger,
@@ -494,6 +498,7 @@ Current node action:
         node: _JourneyNode,
         children_info: dict[str, _ChildInfo],
         shots: Sequence[JourneyReachableNodesEvaluationShot],
+        correction: str | None = None,
     ) -> PromptBuilder:
         builder = PromptBuilder()
 
@@ -601,6 +606,25 @@ Example section is over. The following is the real data you need to use for your
             props={"output_format": self._get_output_format_section(node, children_info)},
         )
 
+        if correction:
+            # Reask: appended last (highest recency) so the model reads the
+            # correction right before responding. Rebuilt from scratch on every
+            # attempt, so the note never stacks across attempts. Mirrors the
+            # schema-validation reask in BaseSchematicGenerator.generate().
+            builder.add_section(
+                name="journey-reachable-nodes-evaluation-correction",
+                template="""
+IMPORTANT — CORRECTION REQUIRED
+-----------------
+{correction}
+
+Respond again with corrected JSON. Use ONLY the child_id values and forward-path ids that appear in the
+node-and-children description above — do not invent ids, and omit conditions_to_child_and_forward entirely for
+children that have no forward paths listed.
+""",
+                props={"correction": correction},
+            )
+
         return builder
 
     def _sort_by_transition_condition(
@@ -624,7 +648,7 @@ Example section is over. The following is the real data you need to use for your
                 info = children_info[id]
                 child_desc = f"""
             "child_id": "{id}",
-            "child_action": "{info.action if info.action else "There is no action to perform in this child step"}",
+            "child_action": "{"<str, a brief gist (a few words) of the child action shown above — do NOT copy the full text>" if info.action else "There is no action to perform in this child step"}",
             "condition_to_child": "{info.edge_condition if info.edge_condition else "<str.There is no condition associated with the transition to this child, if there are other children state here the complementary condition of ALL children>"}",
             "condition_to_child_and_stop": {f"<str, condition_to_child (if exists) AND that child_action hasn't completed (if exists).{REMINDER_OF_ACTION_TYPE_NOT_CHILD}. {REMINDER_OPTIONS}>" if info.action or info.edge_condition else ""},"""
 
@@ -633,8 +657,8 @@ Example section is over. The following is the real data you need to use for your
                     conditions_to_child_and_forward += f"""
                 {{
                     "id": "{path_id}",
-                    "path_condition": "{r.condition}",
-                    "condition_to_child_then_to_path": "<str, child_action completed (if exists) AND condition_to_child (if exists) AND path_condition. {REMINDER_OF_ACTION_TYPE_CHILD}. {REMINDER_OPTIONS}>",
+                    "path_condition": "<str, a few-word gist of path {path_id}; its full condition is listed above — do NOT copy it verbatim>",
+                    "condition_to_child_then_to_path": "<str, the FULL self-contained transition condition for path {path_id}: child_action completed (if exists) AND condition_to_child (if exists) AND the complete path condition spelled out in full here (this is the field used downstream, so do NOT abbreviate it). {REMINDER_OF_ACTION_TYPE_CHILD}. {REMINDER_OPTIONS}>",
                 }},"""
                 if conditions_to_child_and_forward:
                     child_desc += f"""
@@ -660,11 +684,111 @@ OUTPUT FORMAT
 
 ```json
 {{
-    "step_action": "{node.action if node.action else ""}",
+    "step_action": "{"<str, a brief gist (a few words) of the current step action shown above>" if node.action else ""}",
     "step_action_completed": "{f"<str, condition that says that step_action completed, if exists. {REMINDER_OF_ACTION_TYPE_CURRENT}. {REMINDER_OPTIONS}>" if node.action else ""}",{_get_children_condition()}
 }}
 ```
 """
+
+    def _extract_reachable_follow_ups(
+        self,
+        content: ReachableNodesEvaluationSchema,
+        new_graph: dict[str, _JourneyNode],
+        children_info: dict[str, _ChildInfo],
+    ) -> tuple[list[_ReachableFollowUps], list[str]]:
+        """Build the reachable follow-ups from a (schema-valid) model response.
+
+        child_id and forward-path ids are LLM-generated, and the model sometimes
+        returns ids it was never offered (e.g. a forward path for a TOOL child,
+        whose forward block is never rendered in the prompt). Such ids are
+        collected into `problems` and skipped — never dereferenced — so a
+        hallucinated id degrades gracefully instead of raising KeyError. The
+        caller uses `problems` to reask the model.
+        """
+        reachable_follow_ups: list[_ReachableFollowUps] = []
+        problems: list[str] = []
+
+        if not children_info:
+            reachable_follow_ups.append(
+                _ReachableFollowUps(condition=content.step_action_completed, path=["None"])
+            )
+            return reachable_follow_ups, problems
+
+        if not content.children_conditions:
+            return reachable_follow_ups, problems
+
+        for c in content.children_conditions:
+            # Guarding child_id here makes both new_graph[c.child_id] and
+            # children_info[c.child_id] below safe: every children_info key is a
+            # real graph node.
+            if c.child_id not in children_info:
+                problems.append(
+                    f"You referenced child_id '{c.child_id}', which is not one of this step's "
+                    f"children (valid child_ids: {sorted(children_info)})."
+                )
+                continue
+
+            # Condition of the path that ends with child
+            if not new_graph[c.child_id].kind == JourneyNodeKind.FORK:
+                if c.condition_to_child_and_stop is not None:
+                    if (
+                        not children_info[c.child_id].action
+                        and not new_graph[c.child_id].kind == JourneyNodeKind.FORK
+                    ):
+                        path = ["None"]
+                    else:
+                        path = [c.child_id]
+                    reachable_follow_ups.append(
+                        _ReachableFollowUps(
+                            condition=c.condition_to_child_and_stop,
+                            path=path,
+                        )
+                    )
+
+            # Conditions of the paths to child and forward
+            if c.conditions_to_child_and_forward:
+                available = children_info[c.child_id].id_to_reachable_follow_ups
+                for p in c.conditions_to_child_and_forward:
+                    follow_up = available.get(p.id)
+                    if follow_up is None:
+                        # The "reach child and stop" transition (above) is
+                        # independent, so the bogus forward path is dropped either
+                        # way. Only reask when it could be recovered:
+                        if available:
+                            # The child has forward paths but the model picked an
+                            # id that isn't one of them — a reask may fix it.
+                            problems.append(
+                                f"For child '{c.child_id}', you referenced forward-path id "
+                                f"'{p.id}', which is not one of the offered ids "
+                                f"({sorted(available)})."
+                            )
+                        else:
+                            # The child has NO forward paths at all (TOOL / leaf /
+                            # agent-dependent / depth-truncated), so the id is pure
+                            # invention. Reasking can't recover anything, so drop it
+                            # silently rather than burn base+fallback generations.
+                            self._logger.debug(
+                                f"Dropping invented forward-path id '{p.id}' for child "
+                                f"'{c.child_id}', which has no forward paths."
+                            )
+                        continue
+                    # Build a fresh list rather than insert() into the child's
+                    # stored path: that same list object is aliased into every
+                    # parent's children_info, so mutating it in place corrupts it
+                    # for the other parents of a fan-in node and makes the result
+                    # depend on the order in which parents happen to be evaluated.
+                    reachable_follow_ups.append(
+                        _ReachableFollowUps(
+                            condition=p.condition_to_child_then_to_path,
+                            path=[c.child_id, *follow_up.path],
+                        )
+                    )
+
+        return reachable_follow_ups, problems
+
+    def _format_problems_for_reask(self, problems: Sequence[str]) -> str:
+        problem_list = "\n".join(f"- {p}" for p in problems)
+        return f"Your previous response had the following problem(s):\n{problem_list}"
 
     async def do_node_evaluation(
         self,
@@ -674,82 +798,88 @@ OUTPUT FORMAT
     ) -> Sequence[_ReachableFollowUps]:
         node = new_graph[node_idx]
 
-        prompt = self._build_prompt(node, children_info, _baseline_shots)
-
         generation_attempt_temperatures = (
             self._optimization_policy.get_guideline_matching_batch_retry_temperatures(
                 hints={"type": self.__class__.__name__}
             )
         )
 
+        # Reask attempts run at the lowest temperature: a corrective attempt
+        # wants determinism, not format drift (mirrors BaseSchematicGenerator's
+        # schema_validation_retry_temperature).
+        reask_temperature = 0.0
+
+        # When the model returns ids it was never offered, feed them back as a
+        # correction and reask — exhausting each concrete generator in turn (base,
+        # then fallback). A fallback generator only escalates base->fallback on
+        # exceptions from generate(); the invalid-id problem is detected after a
+        # *successful* generation, so we drive the generators ourselves.
+        # `.generators` flattens a composite into its delegates (and is just
+        # `(self,)` for a plain generator), so this needs no knowledge of the
+        # concrete generator type.
+        generators = list(self._schematic_generator.generators)
+
+        correction: str | None = None
+        last_valid_result: list[_ReachableFollowUps] | None = None
         last_generation_exception: Exception | None = None
 
-        for generation_attempt in range(3):
-            try:
-                inference = await self._schematic_generator.generate(
-                    prompt=prompt,
-                    hints={"temperature": generation_attempt_temperatures[generation_attempt]},
+        for generator in generators:
+            for generation_attempt in range(self._SEMANTIC_RETRY_ATTEMPTS):
+                prompt = self._build_prompt(node, children_info, _baseline_shots, correction)
+
+                # The very first attempt honors the policy's leading temperature;
+                # every reask (and every fallback-model attempt) is a correction
+                # and runs at the lowest temperature.
+                is_first_attempt = generator is generators[0] and generation_attempt == 0
+                temperature = (
+                    generation_attempt_temperatures[0] if is_first_attempt else reask_temperature
                 )
+
+                try:
+                    inference = await generator.generate(
+                        prompt=prompt,
+                        hints={"temperature": temperature},
+                    )
+                except Exception as exc:
+                    self._logger.warning(
+                        f"Attempt {generation_attempt} failed: "
+                        f"{''.join(traceback.format_exception(exc))}"
+                    )
+                    last_generation_exception = exc
+                    continue
 
                 self._logger.trace(f"Completion:\n{inference.content.model_dump_json(indent=2)}")
 
-                reachable_follow_ups = []
-
-                if not children_info:
-                    reachable_follow_ups.append(
-                        _ReachableFollowUps(
-                            condition=inference.content.step_action_completed, path=["None"]
-                        )
-                    )
-                elif inference.content.children_conditions:
-                    for c in inference.content.children_conditions:
-                        # Condition of the path that ends with child
-                        if not new_graph[c.child_id].kind == JourneyNodeKind.FORK:
-                            if c.condition_to_child_and_stop is not None:
-                                if (
-                                    not children_info[c.child_id].action
-                                    and not new_graph[c.child_id].kind == JourneyNodeKind.FORK
-                                ):
-                                    path = ["None"]
-                                else:
-                                    path = [c.child_id]
-                                reachable_follow_ups.append(
-                                    _ReachableFollowUps(
-                                        condition=c.condition_to_child_and_stop,
-                                        path=path,
-                                    )
-                                )
-
-                        # Conditions of the paths to child and forward
-                        if c.conditions_to_child_and_forward:
-                            for p in c.conditions_to_child_and_forward:
-                                child_path = (
-                                    children_info[c.child_id].id_to_reachable_follow_ups[p.id].path
-                                )
-                                # Build a fresh list rather than insert() into the
-                                # child's stored path: that same list object is aliased
-                                # into every parent's children_info, so mutating it in
-                                # place corrupts it for the other parents of a fan-in
-                                # node and makes the result depend on the order in which
-                                # parents happen to be evaluated.
-                                reachable_follow_ups.append(
-                                    _ReachableFollowUps(
-                                        condition=p.condition_to_child_then_to_path,
-                                        path=[c.child_id, *child_path],
-                                    )
-                                )
-                # update field in graph node for parents evaluations
-                new_graph[node_idx].reachable_follow_ups = reachable_follow_ups
-                return reachable_follow_ups
-
-            except Exception as exc:
-                self._logger.warning(
-                    f"Attempt {generation_attempt} failed: {traceback.format_exception(exc)}"
+                reachable_follow_ups, problems = self._extract_reachable_follow_ups(
+                    inference.content, new_graph, children_info
                 )
 
-                last_generation_exception = exc
+                if not problems:
+                    # update field in graph node for parents evaluations
+                    new_graph[node_idx].reachable_follow_ups = reachable_follow_ups
+                    return reachable_follow_ups
 
-        raise EvaluationError() from last_generation_exception
+                last_valid_result = reachable_follow_ups
+                correction = self._format_problems_for_reask(problems)
+                self._logger.warning(
+                    f"Attempt {generation_attempt}: dropped {len(problems)} invalid "
+                    f"reference(s); reasking. Problems: {problems}"
+                )
+
+        if last_valid_result is not None:
+            # Base + fallback models all kept inventing ids. Proceed with the
+            # valid transitions (invented ids dropped) rather than abort the whole
+            # routine-set evaluation.
+            self._logger.warning(
+                "Accepting degraded reachable-follow-ups after exhausting base+fallback retries; "
+                "invented ids were dropped."
+            )
+            new_graph[node_idx].reachable_follow_ups = last_valid_result
+            return last_valid_result
+
+        raise EvaluationError(
+            f"All generation attempts for node '{node_idx}' failed"
+        ) from last_generation_exception
 
 
 node_example_1 = _JourneyNode(
@@ -824,42 +954,39 @@ children_info_example_1 = {
 }
 
 expected_result_example_1 = ReachableNodesEvaluationSchema(
-    step_action=node_example_1.action,
+    # step_action / child_action / path_condition are brief gists (the full text
+    # is in the input above); only condition_to_child_then_to_path is spelled out
+    # in full — it's the field read downstream.
+    step_action="ask for pickup location",
     step_action_completed="The customer provided their desired pick up location",
     children_conditions=[
         ChildEvaluation(
             child_id="3",
-            child_action=children_info_example_1["3"].action,
+            child_action="ask for destination",
             condition_to_child=children_info_example_1["3"].edge_condition,
             condition_to_child_and_stop="The customer's desired pick up location is in NYC and customer hasn't provided their destination location yet",
             conditions_to_child_and_forward=[
                 PathCondition(
                     id="1",
-                    path_condition=children_info_example_1["3"]
-                    .id_to_reachable_follow_ups["1"]
-                    .condition,
+                    path_condition="path 1 - destination given, pickup time not provided yet",
                     condition_to_child_then_to_path="The customer's desired pick up location is in NYC and they provided their destination location but hasn't provided the pickup time yet",
                 ),
                 PathCondition(
                     id="2",
-                    path_condition=children_info_example_1["3"]
-                    .id_to_reachable_follow_ups["2"]
-                    .condition,
+                    path_condition="path 2 - destination and pickup time given, taxi not booked",
                     condition_to_child_then_to_path="The customer's desired pick up location is in NYC and they provided their destination location and pickup time but the agent hasn't booked the taxi ride yets",
                 ),
             ],
         ),
         ChildEvaluation(
             child_id="4",
-            child_action=children_info_example_1["4"].action,
+            child_action="inform: we do not operate outside NYC",
             condition_to_child=children_info_example_1["4"].edge_condition,
             condition_to_child_and_stop="The desired pick up location is outside of NYC and the agent informed the customer that we do not operate outside of NYC",
             conditions_to_child_and_forward=[
                 PathCondition(
                     id="1",
-                    path_condition=children_info_example_1["4"]
-                    .id_to_reachable_follow_ups["1"]
-                    .condition,
+                    path_condition="path 1 - informed that we do not operate outside NYC",
                     condition_to_child_then_to_path="The customer's desired pick up location is outside of NYC and the agent hasn't informed the customer that we do not operate outside of NYC",
                 ),
             ],
@@ -921,27 +1048,25 @@ children_info_example_2 = {
 }
 
 expected_result_example_2 = ReachableNodesEvaluationSchema(
-    step_action=node_example_2.action,
+    # step_action / child_action / path_condition are brief gists; the full
+    # options are spelled out only in condition_to_child_then_to_path.
+    step_action="ask for shipping address",
     step_action_completed="The customer provided the shipping address",
     children_conditions=[
         ChildEvaluation(
             child_id="6",
-            child_action=children_info_example_2["6"].action,
+            child_action="ask for delivery speed",
             condition_to_child=children_info_example_2["6"].edge_condition,
             condition_to_child_and_stop="The customer hasn't chosen the delivery speed they prefer: Standard (5-7 days), Express (2-3 days), or Overnight",
             conditions_to_child_and_forward=[
                 PathCondition(
                     id="1",
-                    path_condition=children_info_example_2["6"]
-                    .id_to_reachable_follow_ups["1"]
-                    .condition,
+                    path_condition="path 1 - payment method not chosen (cash or credit)",
                     condition_to_child_then_to_path="The customer chose the delivery speed (Standard, Express or Overnight) but hasn't provided the payment method (cash or credit)",
                 ),
                 PathCondition(
                     id="2",
-                    path_condition=children_info_example_2["6"]
-                    .id_to_reachable_follow_ups["2"]
-                    .condition,
+                    path_condition="path 2 - payment method chosen, order not confirmed",
                     condition_to_child_then_to_path="The customer chose the delivery speed (Standard, Express or Overnight) and provided the payment method (cash or credit) but the agent hasn't confirmed the order yet",
                 ),
             ],

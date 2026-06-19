@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
 import json
-from typing import Any, AsyncIterator, Callable, Generic, Mapping, TypeVar, cast, get_args
+from typing import Any, AsyncIterator, Callable, Generic, Mapping, Sequence, TypeVar, cast, get_args
 from typing_extensions import override
 import weakref
 
@@ -246,6 +246,16 @@ class SchematicGenerator(ABC, Generic[T]):
         generic_args = get_args(orig_class)
         return cast(type[T], generic_args[0])
 
+    @property
+    def generators(self) -> "Sequence[SchematicGenerator[T]]":
+        """The concrete generators this one tries, in order.
+
+        A plain generator is just itself; a composite (e.g. a fallback) flattens
+        into its delegates. This lets callers that need to drive base->fallback
+        escalation themselves do so without knowing the concrete composite type.
+        """
+        return (self,)
+
     @abstractmethod
     async def generate(
         self,
@@ -425,6 +435,13 @@ class FallbackSchematicGenerator(SchematicGenerator[T]):
 
         self._generators = generators
         self._logger = logger
+
+    @property
+    @override
+    def generators(self) -> Sequence[SchematicGenerator[T]]:
+        """The fallback's delegates, flattened (base first), so nested fallbacks
+        collapse into a single ordered sequence of concrete generators."""
+        return tuple(g for delegate in self._generators for g in delegate.generators)
 
     @override
     async def generate(
