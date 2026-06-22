@@ -15,14 +15,17 @@
 from __future__ import annotations
 
 from ast import literal_eval
+import contextlib
 from datetime import datetime, timezone
 import json
 from mailbox import FormatError
 from mcp.types import Tool as McpTool
+import os
 from types import TracebackType
-from typing import Any, Sequence, Mapping, Optional, Literal, Callable, cast
+from typing import Any, Awaitable, Sequence, Mapping, Optional, Literal, Callable, cast
 from typing_extensions import override
 import asyncio
+import httpx
 
 from fastmcp import FastMCP
 from fastmcp.tools import Tool as FastMCPTool
@@ -46,6 +49,19 @@ from parlant.core.tracer import Tracer
 from parlant.core.emissions import EventEmitterFactory
 
 DEFAULT_MCP_PORT: int = 8181
+DEFAULT_MCP_CONNECTION_ATTEMPTS: int = 3
+DEFAULT_MCP_RETRY_DELAY_SECONDS: float = 0.5
+
+# How long a cancelled in-flight tool call is allowed to *drain* (finish
+# against a still-open socket) before we give up and abort it. Sized to cover
+# real tool latency (p99) so that a customer barge-in does not abruptly abort
+# the request mid-stream — an abrupt abort can crash a stateless MCP server's
+# shared session-manager task group (fastmcp#823,
+# modelcontextprotocol/python-sdk#1104). Overridable per deployment so it can
+# be sized to the slowest tools actually in use.
+DEFAULT_MCP_CANCELLATION_GRACE_SECONDS: float = float(
+    os.environ.get("PARLANT_MCP_CANCELLATION_GRACE_SECONDS", "30")
+)
 
 StringBasedTypes = [
     "string",
@@ -143,10 +159,18 @@ class MCPToolClient(ToolService):
         logger: Logger,
         tracer: Tracer,
         port: int = DEFAULT_MCP_PORT,
+        cancellation_grace_seconds: Optional[float] = None,
     ) -> None:
         self._event_emitter_factory = event_emitter_factory
         self._logger = logger
         self._tracer = tracer
+        self._client: Client[StreamableHttpTransport] | None = None
+        self._client_lock = asyncio.Lock()
+        self._cancellation_grace_seconds = (
+            cancellation_grace_seconds
+            if cancellation_grace_seconds is not None
+            else DEFAULT_MCP_CANCELLATION_GRACE_SECONDS
+        )
         if ":" in url[-6:]:
             parts = url.split(":")
             self.url = ":".join(parts[:-1])
@@ -157,14 +181,8 @@ class MCPToolClient(ToolService):
         self.endpoint_url = f"{self.url}:{self.port}"
 
     async def __aenter__(self) -> MCPToolClient:
-        try:
-            self._client = Client(StreamableHttpTransport(url=f"{self.url}:{self.port}/mcp"))
-            await asyncio.wait_for(self._client.__aenter__(), timeout=10.0)  # type: ignore
-            return self
-        except asyncio.TimeoutError:
-            raise ConnectionError(f"Connection to MCP service at {self.url}:{self.port} timed out")
-        except Exception as e:
-            raise Exception(f"Failed to connect to MCP service: {str(e)}")
+        await self._connect(force=True)
+        return self
 
     async def __aexit__(
         self,
@@ -172,20 +190,171 @@ class MCPToolClient(ToolService):
         exc_value: Optional[BaseException],
         traceback: Optional[TracebackType],
     ) -> bool:
-        if self._client:
-            try:
-                await self._client.__aexit__(exc_type, exc_value, traceback)  # type: ignore
-            except RuntimeError:
-                pass
+        await self._disconnect(exc_type, exc_value, traceback)
         return False
+
+    def _create_client(self) -> Client[StreamableHttpTransport]:
+        return Client(StreamableHttpTransport(url=f"{self.url}:{self.port}/mcp"))
+
+    def _is_connected(self) -> bool:
+        return self._client is not None and self._client.is_connected()
+
+    def _is_reconnectable_exception(self, exc: Exception) -> bool:
+        if isinstance(
+            exc,
+            (
+                asyncio.TimeoutError,
+                ConnectionError,
+                httpx.HTTPError,
+                httpx.TimeoutException,
+                httpx.TransportError,
+            ),
+        ):
+            return True
+
+        if isinstance(exc, RuntimeError):
+            message = str(exc).lower()
+            reconnectable_markers = (
+                "client is not connected",
+                "session was closed unexpectedly",
+                "closed unexpectedly",
+            )
+            return any(marker in message for marker in reconnectable_markers)
+
+        return False
+
+    async def _close_client(
+        self,
+        client: Client[StreamableHttpTransport],
+        exc_type: Optional[type[BaseException]] = None,
+        exc_value: Optional[BaseException] = None,
+        traceback: Optional[TracebackType] = None,
+    ) -> None:
+        try:
+            await client.__aexit__(exc_type, exc_value, traceback)  # type: ignore
+        except RuntimeError:
+            pass
+        except Exception as exc:
+            self._logger.warning(f"Failed to close MCP client cleanly: {exc}")
+
+    async def _disconnect(
+        self,
+        exc_type: Optional[type[BaseException]] = None,
+        exc_value: Optional[BaseException] = None,
+        traceback: Optional[TracebackType] = None,
+    ) -> None:
+        async with self._client_lock:
+            if self._client:
+                client = self._client
+                self._client = None
+                await self._close_client(client, exc_type, exc_value, traceback)
+
+    async def _connect(self, force: bool = False) -> Client[StreamableHttpTransport]:
+        async with self._client_lock:
+            if not force and self._is_connected():
+                assert self._client is not None
+                return self._client
+
+            if self._client:
+                stale_client = self._client
+                self._client = None
+                await self._close_client(stale_client)
+
+            last_error: Exception | None = None
+
+            for attempt in range(1, DEFAULT_MCP_CONNECTION_ATTEMPTS + 1):
+                client = self._create_client()
+
+                try:
+                    await asyncio.wait_for(client.__aenter__(), timeout=10.0)  # type: ignore
+                    self._client = client
+                    return client
+                except asyncio.TimeoutError:
+                    last_error = ConnectionError(
+                        f"Connection to MCP service at {self.url}:{self.port} timed out"
+                    )
+                except Exception as exc:
+                    last_error = Exception(f"Failed to connect to MCP service: {str(exc)}")
+                finally:
+                    if self._client is None:
+                        await self._close_client(client)
+
+                if attempt < DEFAULT_MCP_CONNECTION_ATTEMPTS:
+                    self._logger.warning(
+                        f"MCP connection attempt {attempt} failed for {self.url}:{self.port}; retrying"
+                    )
+                    await asyncio.sleep(DEFAULT_MCP_RETRY_DELAY_SECONDS * attempt)
+
+            assert last_error is not None
+            raise last_error
+
+    async def _with_reconnect(
+        self,
+        operation: Callable[[Client[StreamableHttpTransport]], Awaitable[Any]],
+        *,
+        retry_once: bool = True,
+    ) -> Any:
+        client = await self._connect()
+
+        try:
+            return await operation(client)
+        except Exception as exc:
+            if not retry_once or not self._is_reconnectable_exception(exc):
+                raise
+
+            self._logger.warning(
+                f"MCP client session dropped for {self.url}:{self.port}; reconnecting and retrying"
+            )
+            client = await self._connect(force=True)
+            return await operation(client)
+
+    async def _drain_on_cancel(
+        self,
+        make_awaitable: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        # Run the in-flight MCP request as a shielded task. If the turn is
+        # cancelled (e.g. a customer barge-in mid-preparation), do NOT abandon
+        # the request mid-stream: an abrupt client-side abort leaves a stateless
+        # MCP server writing its response to a half-open socket, whose
+        # ClosedResourceError escapes into the shared session-manager task group
+        # and kills it permanently (fastmcp#823,
+        # modelcontextprotocol/python-sdk#1104, both open upstream).
+        #
+        # Instead, give the request a bounded grace window to *drain* (finish
+        # against a still-open socket). If it drains, the server completes its
+        # response cleanly and the connection stays healthy. If it overruns the
+        # grace window we abort it and poison the connection so the next call
+        # reconnects.
+        #
+        # NOTE: draining means the tool runs to completion server-side even
+        # though its result is discarded — a barged-in tool's side effects still
+        # happen (cleaner than the partial execution an abrupt abort produced).
+        task = asyncio.ensure_future(make_awaitable())
+
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task), timeout=self._cancellation_grace_seconds
+                    )
+                except asyncio.TimeoutError:
+                    # Did not drain in time: abort and poison the connection.
+                    task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await asyncio.shield(self._disconnect())
+                except BaseException:
+                    # The request finished within the grace window (with an
+                    # error, or via a second cancellation); the exchange
+                    # completed, so there is nothing to clean up here.
+                    pass
+            raise
 
     @override
     async def list_tools(self) -> Sequence[Tool]:
         try:
-            if not self._client:
-                raise ToolError("Client not initialized.")
-
-            tools = await self._client.list_tools()
+            tools = await self._with_reconnect(lambda client: client.list_tools())
             return [mcp_tool_to_parlant_tool(t) for t in tools]
         except Exception as e:
             raise ToolError(str(e))
@@ -193,9 +362,13 @@ class MCPToolClient(ToolService):
     @override
     async def read_tool(self, name: str) -> Tool:
         try:
-            tools = await self._client.list_tools()
-            tool = next(t for t in tools if t.name == name)
+            tools = await self._with_reconnect(lambda client: client.list_tools())
+            tool = next((t for t in tools if t.name == name), None)
+            if tool is None:
+                raise ToolError(f"Tool '{name}' not found in MCP service at {self.endpoint_url}")
             return mcp_tool_to_parlant_tool(tool)
+        except ToolError:
+            raise
         except Exception as e:
             raise ToolError(str(e))
 
@@ -217,7 +390,11 @@ class MCPToolClient(ToolService):
         try:
             tool = await self.read_tool(name)
             arguments = prepare_tool_arguments(arguments, tool.parameters)
-            result = await self._client.call_tool(name, dict(arguments))
+            client = await self._connect()
+            # The tool call is deliberately not auto-retried on a dropped
+            # session: a reconnect-and-retry could double-execute a
+            # non-idempotent tool. Recovery happens on the next call instead.
+            result = await self._drain_on_cancel(lambda: client.call_tool(name, dict(arguments)))
             return ToolResult(data=mcp_result_to_tool_result_data(result))
         except Exception as e:
             raise ToolError(str(e))
